@@ -53,11 +53,11 @@ fn main() {
     std::thread::sleep(Duration::from_secs(3));
 
     let out = Command::new("ya")
-        .args(["emit-to", &client_id, "cd", "D:\\"])
+        .args(["emit-to", &client_id, "reveal", "D:\\Projects\\gui_for_yazi\\Cargo.toml"])
         .output();
     match out {
         Ok(o) => eprintln!(
-            "[pipe] ya emit-to -> exit={:?} stdout={:?} stderr={:?}",
+            "[pipe] ya emit-to reveal -> exit={:?} stdout={:?} stderr={:?}",
             o.status.code(),
             String::from_utf8_lossy(&o.stdout),
             String::from_utf8_lossy(&o.stderr)

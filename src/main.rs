@@ -147,6 +147,11 @@ impl Root {
     fn go_parent(&self) {
         self.send(&["cd", ".."]);
     }
+
+    fn reveal(&self, name: &str) {
+        let path = std::path::Path::new(&self.cwd).join(name);
+        self.send(&["reveal", &path.to_string_lossy()]);
+    }
 }
 
 impl Render for Root {
@@ -294,6 +299,7 @@ fn file_row(
     } else {
         rgb(0xcdd6f4)
     };
+    let hover_name = name.clone();
 
     div()
         .w_full()
@@ -305,6 +311,11 @@ fn file_row(
         .bg(if hovered { rgb(0x313244) } else { rgb(0x1e1e2e) })
         .cursor_pointer()
         .id(SharedString::from(name.clone()))
+        .on_hover(cx.listener(move |this, hovered, _window, _cx| {
+            if *hovered {
+                this.reveal(&hover_name);
+            }
+        }))
         .on_click(cx.listener(move |this, _event, _window, _cx| {
             if is_dir {
                 this.enter(&name);

@@ -161,6 +161,44 @@ impl Root {
         let path = std::path::Path::new(&self.cwd).join(name);
         self.send(&["reveal", &path.to_string_lossy()]);
     }
+
+    fn open_hovered(&self, cx: &mut Context<Self>) {
+        let Some(h) = self.hovered.clone() else { return };
+        let name = file_name_of(&h);
+        let is_dir = self.files.iter().any(|f| f.name == name && f.is_dir);
+        if is_dir {
+            self.enter(&name);
+            return;
+        }
+        cx.spawn(async move |_weak, cx| {
+            cx.background_executor()
+                .spawn(async move {
+                    let _ = open::that(&h);
+                })
+                .await;
+        })
+        .detach();
+    }
+
+    fn delete_hovered(&self, cx: &mut Context<Self>) {
+        let Some(h) = self.hovered.clone() else { return };
+        let cwd = self.cwd.clone();
+        cx.spawn(async move |weak, cx| {
+            let path2 = h.clone();
+            let ok = cx
+                .background_executor()
+                .spawn(async move { trash::delete(&path2).is_ok() })
+                .await;
+            if ok {
+                let cwd2 = cwd.clone();
+                weak.update(cx, |this, _cx| {
+                    this.send(&["cd", cwd2.as_str()]);
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
 }
 
 impl Render for Root {
@@ -185,6 +223,20 @@ impl Render for Root {
                     .gap_3()
                     .child(div().flex_1().text_sm().child(cwd))
                     .child(parent_button(cx)),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .px_3()
+                    .py_1()
+                    .bg(rgb(0x181825))
+                    .flex()
+                    .gap_2()
+                    .child(action_button(cx, "btn-open", "打开", |this, cx| this.open_hovered(cx)))
+                    .child(action_button(cx, "btn-delete", "删除", |this, cx| this.delete_hovered(cx)))
+                    .child(action_button(cx, "btn-yank", "复制", |this, _cx| this.send(&["yank"])))
+                    .child(action_button(cx, "btn-cut", "剪切", |this, _cx| this.send(&["cut"])))
+                    .child(action_button(cx, "btn-paste", "粘贴", |this, _cx| this.send(&["paste"]))),
             )
             .child(
                 div()
@@ -284,6 +336,26 @@ fn parent_button(cx: &mut Context<Root>) -> impl IntoElement {
         .id("btn-parent")
         .on_click(cx.listener(|this, _event, _window, _cx| {
             this.go_parent();
+        }))
+}
+
+fn action_button(
+    cx: &mut Context<Root>,
+    id: &'static str,
+    label: &'static str,
+    on_click: impl Fn(&mut Root, &mut Context<Root>) + 'static,
+) -> impl IntoElement {
+    div()
+        .px_2()
+        .py_1()
+        .bg(rgb(0x313244))
+        .rounded_md()
+        .cursor_pointer()
+        .text_sm()
+        .child(label)
+        .id(id)
+        .on_click(cx.listener(move |this, _event, _window, cx| {
+            on_click(this, cx);
         }))
 }
 

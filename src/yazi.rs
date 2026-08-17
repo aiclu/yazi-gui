@@ -5,14 +5,27 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// 一个文件条目（来自 yazi 插件发布的文件列表）。
+#[derive(Debug, Clone)]
+pub struct FileEntry {
+    pub name: String,
+    pub is_dir: bool,
+    pub is_hidden: bool,
+    pub size: u64,
+    pub mtime: f64,
+}
+
 /// 一个从 yazi `--local-events` 流解析出来的事件。
 #[derive(Debug, Clone)]
 pub enum YaziEvent {
-    /// 目录切换。url 是新的工作目录。
     Cd { tab: usize, url: Option<String> },
-    /// 光标悬停到某个文件。url 为 None 表示没有悬停。
     Hover { tab: usize, url: Option<String> },
-    /// 其他事件（rename/trash/delete/move/bulk 等），保留原始 kind 和 body。
+    /// 完整目录列表（由 gui-files 插件通过 ps.pub 发布）。
+    GuiFiles {
+        cwd: String,
+        files: Vec<FileEntry>,
+        hovered: Option<String>,
+    },
     Other { kind: String, body: serde_json::Value },
 }
 
@@ -27,28 +40,53 @@ impl YaziEvent {
         let body: serde_json::Value = serde_json::from_str(body_str).ok()?;
 
         let tab = body.get("tab").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let url = body
-            .get("url")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned);
+        let url = body.get("url").and_then(|v| v.as_str()).map(str::to_owned);
 
         match kind {
             "cd" => Some(YaziEvent::Cd { tab, url }),
             "hover" => Some(YaziEvent::Hover { tab, url }),
+            "gui-files" => {
+                let cwd = body
+                    .get("cwd")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let files = body
+                    .get("files")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(parse_file_entry).collect())
+                    .unwrap_or_default();
+                let hovered = body.get("hovered").and_then(|v| v.as_str()).map(str::to_owned);
+                Some(YaziEvent::GuiFiles { cwd, files, hovered })
+            }
             _ => Some(YaziEvent::Other {
                 kind: kind.to_string(),
                 body,
             }),
         }
     }
+}
 
-    pub fn label(&self) -> String {
-        match self {
-            YaziEvent::Cd { url, .. } => format!("cd  -> {:?}", url),
-            YaziEvent::Hover { url, .. } => format!("hover -> {:?}", url),
-            YaziEvent::Other { kind, .. } => format!("{}", kind),
-        }
-    }
+fn parse_file_entry(v: &serde_json::Value) -> Option<FileEntry> {
+    let name = v.get("name")?.as_str()?.to_string();
+    let is_dir = v.get("is_dir").and_then(|x| x.as_bool()).unwrap_or(false);
+    let is_hidden = v
+        .get("is_hidden")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
+    let size = v
+        .get("size")
+        .and_then(|x| x.as_u64())
+        .or_else(|| v.get("size").and_then(|x| x.as_f64()).map(|f| f as u64))
+        .unwrap_or(0);
+    let mtime = v.get("mtime").and_then(|x| x.as_f64()).unwrap_or(0.0);
+    Some(FileEntry {
+        name,
+        is_dir,
+        is_hidden,
+        size,
+        mtime,
+    })
 }
 
 /// 一个 yazi 后端进程的客户端句柄：负责启动进程、接收事件、发送动作。
@@ -64,14 +102,18 @@ impl YaziClient {
             "{}",
             SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis()
         );
+        let config_home = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets")
+            .join("yazi");
 
         let mut child = Command::new("yazi")
             .args([
                 "--client-id",
                 client_id.as_str(),
                 "--local-events",
-                "cd,hover,rename,trash,delete,move,bulk",
+                "cd,hover,gui-files",
             ])
+            .env("YAZI_CONFIG_HOME", config_home)
             .current_dir(cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

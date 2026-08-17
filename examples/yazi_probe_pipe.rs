@@ -17,8 +17,9 @@ fn main() {
             "--client-id",
             &client_id,
             "--local-events",
-            "cd,hover,rename,trash,delete,move,bulk",
+            "cd,hover,gui-files",
         ])
+        .env("YAZI_CONFIG_HOME", "D:\\Projects\\gui_for_yazi\\assets\\yazi")
         .current_dir("D:\\Projects\\gui_for_yazi")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

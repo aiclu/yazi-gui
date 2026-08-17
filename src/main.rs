@@ -1,4 +1,6 @@
 use gpui::*;
+use std::ops::Range;
+use std::sync::OnceLock;
 
 mod yazi;
 use yazi::{FileEntry, YaziClient, YaziEvent};
@@ -11,6 +13,10 @@ enum Preview {
     Dir,
     Binary { size: u64 },
     Image { path: String },
+    Code {
+        text: String,
+        highlights: Vec<(Range<usize>, HighlightStyle)>,
+    },
     Text(String),
 }
 
@@ -135,21 +141,27 @@ impl Root {
 
         cx.spawn(async move |weak, cx| {
             let path2 = path.clone();
-            let bytes = cx
+            // 读取 + 截断 + 语法高亮，全部放后台线程（syntect 是 CPU 密集）。
+            let result = cx
                 .background_executor()
-                .spawn(async move { std::fs::read(&path2).ok() })
+                .spawn(async move {
+                    let bytes = std::fs::read(&path2).ok()?;
+                    if !is_probably_text(&bytes) {
+                        return None;
+                    }
+                    let text = String::from_utf8_lossy(&bytes).into_owned();
+                    let truncated = truncate_preview(&text);
+                    let ext = extension_of(&path2);
+                    let highlights = highlight_code(&truncated, &ext);
+                    Some((truncated, highlights))
+                })
                 .await;
-            let text = bytes.and_then(|b| {
-                if is_probably_text(&b) {
-                    Some(String::from_utf8_lossy(&b).into_owned())
-                } else {
-                    None
-                }
-            });
+
             weak.update(cx, |this, cx| {
                 if this.preview_path.as_deref() == Some(path.as_str()) {
-                    this.preview = match text {
-                        Some(t) => Preview::Text(truncate_preview(&t)),
+                    this.preview = match result {
+                        Some((text, Some(highlights))) => Preview::Code { text, highlights },
+                        Some((text, None)) => Preview::Text(text),
                         None => Preview::Binary { size },
                     };
                     cx.notify();
@@ -476,6 +488,12 @@ impl Root {
                 .h(px(400.0))
                 .object_fit(ObjectFit::Contain)
                 .into_any_element(),
+            Preview::Code { text, highlights } => div()
+                .text_xs()
+                .child(
+                    StyledText::new(text.clone()).with_highlights(highlights.clone()),
+                )
+                .into_any_element(),
             Preview::Text(t) => div()
                 .text_xs()
                 .child(SharedString::from(t.clone()))
@@ -641,6 +659,74 @@ fn truncate_preview(s: &str) -> String {
         }
         format!("{}\n\n... (预览已截断)", &s[..end])
     }
+}
+
+// ---- 语法高亮（syntect） ----
+
+fn extension_of(path: &str) -> String {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+static SYNTAX_SET: OnceLock<syntect::parsing::SyntaxSet> = OnceLock::new();
+static THEME_SET: OnceLock<syntect::highlighting::ThemeSet> = OnceLock::new();
+
+fn syntax_set() -> &'static syntect::parsing::SyntaxSet {
+    SYNTAX_SET.get_or_init(syntect::parsing::SyntaxSet::load_defaults_newlines)
+}
+
+fn theme_set() -> &'static syntect::highlighting::ThemeSet {
+    THEME_SET.get_or_init(syntect::highlighting::ThemeSet::load_defaults)
+}
+
+/// 把 syntect 的 Style 转成 GPUI 的 HighlightStyle。
+fn syntect_to_gpui_style(style: syntect::highlighting::Style) -> HighlightStyle {
+    use syntect::highlighting::FontStyle as SynFontStyle;
+    let c = style.foreground;
+    HighlightStyle {
+        color: Some(
+            rgb(((c.r as u32) << 16) | ((c.g as u32) << 8) | (c.b as u32)).into(),
+        ),
+        font_weight: if style.font_style.contains(SynFontStyle::BOLD) {
+            Some(FontWeight::BOLD)
+        } else {
+            None
+        },
+        font_style: if style.font_style.contains(SynFontStyle::ITALIC) {
+            Some(gpui::FontStyle::Italic)
+        } else {
+            None
+        },
+        ..Default::default()
+    }
+}
+
+/// 对文本做语法高亮，返回字节区间 -> 高亮样式。无匹配语法时返回 None。
+fn highlight_code(text: &str, ext: &str) -> Option<Vec<(Range<usize>, HighlightStyle)>> {
+    use syntect::easy::HighlightLines;
+    use syntect::util::LinesWithEndings;
+
+    let ss = syntax_set();
+    let syntax = ss.find_syntax_by_extension(ext)?;
+    let theme = theme_set().themes.get("base16-ocean.dark")?;
+    let mut highlighter = HighlightLines::new(syntax, theme);
+
+    let mut highlights = Vec::new();
+    let mut pos = 0usize;
+    for line in LinesWithEndings::from(text) {
+        let ranges = highlighter.highlight_line(line, ss).ok()?;
+        for (style, seg) in ranges {
+            let len = seg.len();
+            if len > 0 {
+                highlights.push((pos..pos + len, syntect_to_gpui_style(style)));
+            }
+            pos += len;
+        }
+    }
+    Some(highlights)
 }
 
 fn human_size(bytes: u64) -> String {

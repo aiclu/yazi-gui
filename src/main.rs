@@ -188,6 +188,7 @@ impl Render for Root {
             )
             .child(
                 div()
+                    .flex()
                     .flex_1()
                     .flex_row()
                     .child(self.file_list(cx))

@@ -84,6 +84,8 @@ struct Tab {
     selected: Vec<String>,
     /// Shift 范围选择的锚点（文件在 files 中的下标）。
     anchor: Option<usize>,
+    /// 是否处于「此电脑」虚拟视图（列出所有磁盘，不经过 yazi）。
+    computer_view: bool,
 }
 
 impl Tab {
@@ -93,6 +95,7 @@ impl Tab {
             files: Vec::new(),
             selected: Vec::new(),
             anchor: None,
+            computer_view: false,
         }
     }
 }
@@ -190,6 +193,8 @@ impl Root {
             YaziEvent::Cd { url, .. } => {
                 if let Some(u) = url {
                     self.cur_mut().cwd = u;
+                    // 收到 cd 事件说明 yazi 已切目录，离开「此电脑」视图
+                    self.cur_mut().computer_view = false;
                 }
             }
             YaziEvent::Hover { .. } => {}
@@ -363,12 +368,35 @@ impl Root {
         }
     }
 
-    fn enter(&self, name: &str) {
+    fn enter(&mut self, name: &str) {
+        if self.cur().computer_view {
+            // 点击盘符：进入该磁盘根目录
+            self.cur_mut().computer_view = false;
+            self.cur_mut().cwd = name.to_string();
+            self.cur_mut().selected.clear();
+            self.cur_mut().anchor = None;
+            self.preview = Preview::Empty;
+            self.preview_path = None;
+            self.send(&["cd", name]);
+            return;
+        }
         let path = std::path::Path::new(&self.cur().cwd).join(name);
         self.send(&["cd", &path.to_string_lossy()]);
     }
 
-    fn go_parent(&self) {
+    fn go_parent(&mut self) {
+        if self.cur().computer_view {
+            return; // 已在「此电脑」顶层
+        }
+        if is_drive_root(&self.cur().cwd) {
+            // 从盘符根向上 → 进入「此电脑」虚拟视图
+            self.cur_mut().computer_view = true;
+            self.cur_mut().selected.clear();
+            self.cur_mut().anchor = None;
+            self.preview = Preview::Empty;
+            self.preview_path = None;
+            return;
+        }
         self.send(&["cd", ".."]);
     }
 
@@ -387,11 +415,15 @@ impl Root {
         .detach();
     }
 
-    fn open_selected(&self, cx: &mut Context<Self>) {
+    fn open_selected(&mut self, cx: &mut Context<Self>) {
         let tab = self.cur();
         let Some(name) = tab.selected.first().cloned() else {
             return;
         };
+        if tab.computer_view {
+            self.enter(&name);
+            return;
+        }
         let is_dir = tab.files.iter().any(|f| f.name == name && f.is_dir);
         if is_dir {
             self.enter(&name);
@@ -401,6 +433,9 @@ impl Root {
     }
 
     fn delete_selected(&self, cx: &mut Context<Self>) {
+        if self.cur().computer_view {
+            return;
+        }
         let cwd = self.cur().cwd.clone();
         let paths: Vec<String> = self
             .cur()
@@ -617,6 +652,9 @@ impl Root {
     // ---- 输入模式（重命名 / 新建） ----
 
     fn start_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cur().computer_view {
+            return;
+        }
         let tab = self.cur();
         let Some(name) = tab.selected.first().cloned() else {
             return;
@@ -785,18 +823,19 @@ impl Root {
             .child(new_tab_button(cx, theme))
     }
 
-    fn context_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let Some(menu) = &self.menu else { return div() };
+    fn context_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(menu) = &self.menu else { return div().into_any_element() };
         let theme = self.theme;
         let pos = menu.position;
-        let items = menu_items_for(&menu.target);
+        let items = menu_items_for(&menu.target, self.cur().computer_view);
 
         div()
             .absolute()
             .top_0()
             .left_0()
             .size_full()
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, _e, _w, cx| {
+            .id("menu-mask")
+            .on_click(cx.listener(|this, _e, _w, cx| {
                 this.close_menu(cx);
             }))
             .child(
@@ -814,6 +853,7 @@ impl Root {
                         menu_item(cx, theme, label, *action)
                     })),
             )
+            .into_any_element()
     }
 }
 
@@ -825,8 +865,17 @@ impl Focusable for Root {
 
 impl Render for Root {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let cwd = SharedString::from(self.cur().cwd.clone());
-        let status = SharedString::from(format!("{} 项", self.cur().files.len()));
+        let computer_view = self.cur().computer_view;
+        let cwd = SharedString::from(if computer_view {
+            "此电脑".to_string()
+        } else {
+            self.cur().cwd.clone()
+        });
+        let status = SharedString::from(if computer_view {
+            format!("{} 个磁盘", drives().len())
+        } else {
+            format!("{} 项", self.cur().files.len())
+        });
         let focus_handle = self.focus_handle.clone();
         let theme = self.theme;
 
@@ -898,7 +947,21 @@ impl Render for Root {
 
 impl Root {
     fn file_list(&self, cx: &Context<Self>) -> impl IntoElement {
-        let selected_names = &self.cur().selected;
+        let theme = self.theme;
+        let computer_view = self.cur().computer_view;
+        let selected: Vec<String> = self.cur().selected.clone();
+
+        // computer_view 时显示磁盘盘符；否则显示当前目录文件。
+        let entries: Vec<(String, bool, u64)> = if computer_view {
+            drives().iter().map(|d| (d.clone(), true, 0u64)).collect()
+        } else {
+            self.cur()
+                .files
+                .iter()
+                .map(|f| (f.name.clone(), f.is_dir, f.size))
+                .collect()
+        };
+
         div()
             .flex_1()
             .id("file-list")
@@ -910,12 +973,9 @@ impl Root {
                 this.open_menu(None, event.position, cx);
                 cx.stop_propagation();
             }))
-            .children(self.cur().files.iter().map(|f| {
-                let name = f.name.clone();
-                let is_dir = f.is_dir;
-                let size = f.size;
-                let selected = selected_names.iter().any(|s| s == &name);
-                file_row(cx, self.theme, name, is_dir, size, selected)
+            .children(entries.iter().map(|(name, is_dir, size)| {
+                let selected = selected.iter().any(|s| s == name);
+                file_row(cx, theme, name.clone(), *is_dir, *size, selected)
             }))
     }
 
@@ -1091,7 +1151,10 @@ fn action_button(
 }
 
 /// 根据右键目标生成菜单项。
-fn menu_items_for(target: &Option<String>) -> Vec<(&'static str, MenuAction)> {
+fn menu_items_for(target: &Option<String>, computer_view: bool) -> Vec<(&'static str, MenuAction)> {
+    if computer_view {
+        return vec![("打开", MenuAction::Open)];
+    }
     match target {
         Some(_) => vec![
             ("打开", MenuAction::Open),
@@ -1184,6 +1247,29 @@ fn file_name_of(url: &str) -> String {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| url.to_string())
+}
+
+/// 判断路径是否为盘符根（如 `D:\`、`C:`）。
+fn is_drive_root(cwd: &str) -> bool {
+    let bytes = cwd.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        let rest = &cwd[2..];
+        rest.is_empty() || rest == "\\" || rest == "/"
+    } else {
+        false
+    }
+}
+
+static DRIVES: OnceLock<Vec<String>> = OnceLock::new();
+
+/// 扫描存在的磁盘盘符（A-Z），首次调用后缓存。
+fn drives() -> &'static Vec<String> {
+    DRIVES.get_or_init(|| {
+        (b'A'..=b'Z')
+            .map(|c| format!("{}:\\", c as char))
+            .filter(|d| std::path::Path::new(d).exists())
+            .collect()
+    })
 }
 
 /// 递归复制目录（普通文件 + 子目录，忽略符号链接/权限错误）。

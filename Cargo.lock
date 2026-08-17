@@ -6768,7 +6768,10 @@ checksum = "e01738255b5a16e78bbb83e7fbba0a1e7dd506905cfc53f4622d89015a03fbb5"
 name = "yazi-gui"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "gpui",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
@@ -105,6 +105,71 @@ fn parse_file_entry(v: &serde_json::Value) -> Option<FileEntry> {
     })
 }
 
+#[cfg(debug_assertions)]
+fn runtime_config_home() -> Result<PathBuf> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("yazi");
+    ensure_directory(path)
+}
+
+#[cfg(not(debug_assertions))]
+fn runtime_config_home() -> Result<PathBuf> {
+    let executable = std::env::current_exe()?;
+    let parent = executable
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("release executable has no parent directory"))?;
+    ensure_directory(parent.join("assets").join("yazi"))
+}
+
+fn ensure_directory(path: PathBuf) -> Result<PathBuf> {
+    if path.is_dir() {
+        Ok(path)
+    } else {
+        Err(anyhow::anyhow!(
+            "yazi config directory not found: {}",
+            path.display()
+        ))
+    }
+}
+
+#[cfg(feature = "bundled-yazi")]
+fn yazi_binary() -> Result<PathBuf> {
+    bundled_binary("yazi.exe")
+}
+
+#[cfg(not(feature = "bundled-yazi"))]
+fn yazi_binary() -> Result<PathBuf> {
+    Ok(PathBuf::from("yazi"))
+}
+
+#[cfg(feature = "bundled-yazi")]
+fn ya_binary() -> Result<PathBuf> {
+    bundled_binary("ya.exe")
+}
+
+#[cfg(not(feature = "bundled-yazi"))]
+fn ya_binary() -> Result<PathBuf> {
+    Ok(PathBuf::from("ya"))
+}
+
+#[cfg(feature = "bundled-yazi")]
+fn bundled_binary(name: &str) -> Result<PathBuf> {
+    let executable = std::env::current_exe()?;
+    let parent = executable
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("bundled executable has no parent directory"))?;
+    let path = parent.join(name);
+    if path.is_file() {
+        Ok(path)
+    } else {
+        Err(anyhow::anyhow!(
+            "bundled yazi binary not found: {}",
+            path.display()
+        ))
+    }
+}
+
 /// 一个 yazi 后端进程的客户端句柄：负责启动进程、接收事件、发送动作。
 pub struct YaziClient {
     client_id: String,
@@ -118,11 +183,10 @@ impl YaziClient {
             "{}",
             SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis()
         );
-        let config_home = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("assets")
-            .join("yazi");
+        let config_home = runtime_config_home()?;
+        let yazi = yazi_binary()?;
 
-        let mut child = Command::new("yazi")
+        let mut child = Command::new(yazi)
             .args([
                 "--client-id",
                 client_id.as_str(),
@@ -182,10 +246,8 @@ impl YaziClient {
         let mut args = vec!["emit-to", client_id];
         args.extend(action.iter().map(String::as_str));
 
-        let out = Command::new("ya")
-            .args(&args)
-            .stdin(Stdio::null())
-            .output()?;
+        let ya = ya_binary()?;
+        let out = Command::new(ya).args(&args).stdin(Stdio::null()).output()?;
 
         let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();

@@ -70,6 +70,14 @@ _Avoid_: shortcut text field, multi-stroke binding
 The SVG master and multi-size Windows ICO compiled into resource ID 1 for both the GPUI window and notification-area icon.
 _Avoid_: generic application icon, file-type icon
 
+**Release Package**:
+A Windows x64 zip produced from a `v*` tag. The GUI-only package uses yazi/ya from `PATH`; the bundled package uses the explicitly compiled-in bundled-yazi mode and ships yazi/ya 26.8.15 beside the GUI.
+_Avoid_: source checkout, debug build
+
+**Bundled Yazi**:
+The fixed yazi 26.8.15 and ya 26.8.15 binaries included in the bundled Release package. The bundled build does not silently switch to a system executable.
+_Avoid_: latest yazi, optional fallback binary
+
 **Status Message**:
 The latest user-facing result or error for a file operation, shown alongside the active view's item count.
 _Avoid_: log line, notification toast

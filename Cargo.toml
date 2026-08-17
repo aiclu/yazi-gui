@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 description = "A native GUI for the yazi terminal file manager, powered by GPUI and yazi's DDS event stream."
 
+[features]
+default = []
+bundled-yazi = []
+
 [dependencies]
 gpui = "0.2.2"
 anyhow = "1"

@@ -4,7 +4,10 @@
 
 - `src/main.rs` contains the GPUI application, tabs, selection, previews, themes, and file operations.
 - `src/yazi.rs` owns the yazi subprocess bridge, event parsing, and `ya emit-to` commands.
+- `src/settings.rs` and `src/tray.rs` own settings persistence and the Windows tray bridge.
 - `assets/yazi/` contains the runtime yazi configuration and the `gui-files.yazi` plugin that publishes directory state.
+- `.github/workflows/release.yml` builds the two Windows release packages from `v*` tags.
+- `docs/adr/` records architecture decisions; `assets/icons/` contains application icon sources.
 - `examples/` contains standalone probes for syntax highlighting, trash behavior, and yazi pipes/operations.
 - `target/` is generated build output and should remain uncommitted.
 
@@ -15,8 +18,10 @@ Install Rust with edition 2024 support, and make both `yazi` and `ya` available 
 - `cargo fmt --all` — format Rust sources.
 - `cargo check` — compile-check the crate quickly.
 - `cargo build` — create a debug build.
-- `cargo run` — launch the GUI. Set `START_DIR` in `src/main.rs` to a valid local directory before running.
-- `cargo test` — run the test harness; the repository currently has no committed automated tests.
+- `cargo build --release` — create the GUI-only release build.
+- `cargo build --release --features bundled-yazi` — create the release build that uses bundled yazi/ya binaries.
+- `cargo run` — launch the GUI from the current working directory; navigate elsewhere with Computer View or the address bar.
+- `cargo test` — run the committed unit tests for parsing, sorting, search, file operations, and settings.
 - `cargo run --example highlight_probe` — verify syntect setup. The yazi probes require a working yazi installation and use local paths.
 
 ## Coding Style & Naming Conventions

@@ -44,7 +44,12 @@ use settings::{AppSettings, Language, ThemeMode};
 mod tray;
 use tray::{TrayCommand, TrayController};
 
-const START_DIR: &str = "D:\\Projects\\gui_for_yazi";
+fn default_start_dir() -> String {
+    std::env::current_dir()
+        .expect("current working directory is unavailable")
+        .to_string_lossy()
+        .into_owned()
+}
 
 fn load_settings_or_exit() -> AppSettings {
     match settings::load() {
@@ -416,6 +421,7 @@ struct Root {
 impl Root {
     fn new(cx: &mut Context<Self>) -> Self {
         let settings = load_settings_or_exit();
+        let start_dir = default_start_dir();
         let theme = match settings.theme {
             ThemeMode::Dark => Theme::dark(),
             ThemeMode::Light => Theme::light(),
@@ -429,7 +435,7 @@ impl Root {
         };
         let mut root = Self {
             client: None,
-            tabs: vec![Tab::new(START_DIR)],
+            tabs: vec![Tab::new(&start_dir)],
             active: 0,
             drive_roots: Vec::new(),
             clipboard: None,
@@ -935,7 +941,8 @@ impl Root {
     }
 
     fn start_yazi(&mut self, cx: &mut Context<Self>) {
-        match YaziClient::spawn(std::path::Path::new(START_DIR)) {
+        let cwd = self.cur().cwd.clone();
+        match YaziClient::spawn(Path::new(&cwd)) {
             Ok((client, mut rx)) => {
                 self.client = Some(client);
                 cx.spawn(async move |weak, cx| {

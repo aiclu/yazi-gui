@@ -28,6 +28,7 @@ end
 function M.setup()
 	ps.sub("cd", publish_files)
 	ps.sub("hover", publish_files)
+	ps.sub("refresh", publish_files)
 end
 
 return M

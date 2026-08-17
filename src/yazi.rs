@@ -18,15 +18,24 @@ pub struct FileEntry {
 /// 一个从 yazi `--local-events` 流解析出来的事件。
 #[derive(Debug, Clone)]
 pub enum YaziEvent {
-    Cd { tab: usize, url: Option<String> },
-    Hover { tab: usize, url: Option<String> },
+    Cd {
+        tab: usize,
+        url: Option<String>,
+    },
+    Hover {
+        tab: usize,
+        url: Option<String>,
+    },
     /// 完整目录列表（由 gui-files 插件通过 ps.pub 发布）。
     GuiFiles {
         cwd: String,
         files: Vec<FileEntry>,
         hovered: Option<String>,
     },
-    Other { kind: String, body: serde_json::Value },
+    Other {
+        kind: String,
+        body: serde_json::Value,
+    },
 }
 
 impl YaziEvent {
@@ -56,8 +65,15 @@ impl YaziEvent {
                     .and_then(|v| v.as_array())
                     .map(|arr| arr.iter().filter_map(parse_file_entry).collect())
                     .unwrap_or_default();
-                let hovered = body.get("hovered").and_then(|v| v.as_str()).map(str::to_owned);
-                Some(YaziEvent::GuiFiles { cwd, files, hovered })
+                let hovered = body
+                    .get("hovered")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+                Some(YaziEvent::GuiFiles {
+                    cwd,
+                    files,
+                    hovered,
+                })
             }
             _ => Some(YaziEvent::Other {
                 kind: kind.to_string(),
@@ -149,8 +165,22 @@ impl YaziClient {
 
     /// 通过 `ya emit-to <client_id> <action...>` 向 yazi 发送一个动作。
     pub fn send(&self, action: &[&str]) -> Result<String> {
-        let mut args = vec!["emit-to", self.client_id.as_str()];
-        args.extend_from_slice(action);
+        Self::send_with_client_id(
+            &self.client_id,
+            &action
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
+    pub fn send_with_client_id(client_id: &str, action: &[String]) -> Result<String> {
+        let mut args = vec!["emit-to", client_id];
+        args.extend(action.iter().map(String::as_str));
 
         let out = Command::new("ya")
             .args(&args)

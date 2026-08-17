@@ -1,18 +1,95 @@
 use gpui::*;
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use std::cmp::Ordering;
+use std::fs::{self, File};
+use std::io::{self, Read, Write};
 use std::ops::Range;
-use std::sync::OnceLock;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
+};
+use time::{OffsetDateTime, UtcOffset};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use unicode_segmentation::UnicodeSegmentation;
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+#[cfg(windows)]
+use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOTE;
+
+actions!(
+    yazi_input,
+    [
+        Backspace,
+        Delete,
+        Left,
+        Right,
+        SelectLeft,
+        SelectRight,
+        SelectAll,
+        Home,
+        End,
+        PasteText,
+        CopyText,
+        CutText,
+    ]
+);
 
 mod yazi;
 use yazi::{FileEntry, YaziClient, YaziEvent};
+mod settings;
+use settings::{AppSettings, Language, ThemeMode};
+mod tray;
+use tray::{TrayCommand, TrayController};
 
 const START_DIR: &str = "D:\\Projects\\gui_for_yazi";
+
+fn load_settings_or_exit() -> AppSettings {
+    match settings::load() {
+        Ok(settings) => settings,
+        Err(error) => {
+            let message = format!("设置文件无效：{error}");
+            #[cfg(windows)]
+            {
+                use windows_sys::Win32::UI::WindowsAndMessaging::{
+                    MB_ICONERROR, MB_OK, MessageBoxW,
+                };
+                let text: Vec<u16> = std::ffi::OsStr::new(&message)
+                    .encode_wide()
+                    .chain(std::iter::once(0))
+                    .collect();
+                let title: Vec<u16> = std::ffi::OsStr::new("yazi-gui")
+                    .encode_wide()
+                    .chain(std::iter::once(0))
+                    .collect();
+                unsafe {
+                    MessageBoxW(
+                        std::ptr::null_mut(),
+                        text.as_ptr(),
+                        title.as_ptr(),
+                        MB_OK | MB_ICONERROR,
+                    );
+                }
+                std::process::exit(1);
+            }
+            #[cfg(not(windows))]
+            panic!("{message}");
+        }
+    }
+}
 
 enum Preview {
     Empty,
     Loading,
     Dir,
-    Binary { size: u64 },
-    Image { path: String },
+    Binary {
+        size: u64,
+    },
+    Image {
+        path: String,
+    },
     Code {
         text: String,
         highlights: Vec<(Range<usize>, HighlightStyle)>,
@@ -23,12 +100,10 @@ enum Preview {
 /// 界面配色主题。颜色采用 Catppuccin 色板。
 #[derive(Clone, Copy)]
 struct Theme {
-    name: &'static str,
     base: Hsla,
     mantle: Hsla,
     surface0: Hsla,
     crust: Hsla,
-    surface1: Hsla,
     text: Hsla,
     muted: Hsla,
     blue: Hsla,
@@ -39,12 +114,10 @@ impl Theme {
     /// 暗色（Catppuccin Mocha）。
     fn dark() -> Self {
         Theme {
-            name: "暗色",
             base: rgb(0x1e1e2e).into(),
             mantle: rgb(0x181825).into(),
             surface0: rgb(0x313244).into(),
             crust: rgb(0x11111b).into(),
-            surface1: rgb(0x45475a).into(),
             text: rgb(0xcdd6f4).into(),
             muted: rgb(0x6c7086).into(),
             blue: rgb(0x89b4fa).into(),
@@ -55,12 +128,10 @@ impl Theme {
     /// 浅色（Catppuccin Latte）。
     fn light() -> Self {
         Theme {
-            name: "浅色",
             base: rgb(0xeff1f5).into(),
             mantle: rgb(0xe6e9ef).into(),
             surface0: rgb(0xccd0da).into(),
             crust: rgb(0xdce0e8).into(),
-            surface1: rgb(0xbcc0cc).into(),
             text: rgb(0x4c4f69).into(),
             muted: rgb(0x8c8fa1).into(),
             blue: rgb(0x1e66f5).into(),
@@ -70,10 +141,129 @@ impl Theme {
 }
 
 /// 输入模式下的待处理操作。
+#[derive(Clone)]
 enum PendingOp {
     Rename { path: String },
     NewFile,
     NewDir,
+    GoToPath,
+    Search,
+    EditShortcut(ShortcutAction),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Files,
+    Settings,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShortcutAction {
+    Open,
+    Search,
+    NewTab,
+    CloseTab,
+    Delete,
+    Rename,
+    Copy,
+    Cut,
+    Paste,
+    NewFile,
+    NewDir,
+}
+
+impl ShortcutAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Open => "打开",
+            Self::Search => "搜索",
+            Self::NewTab => "新建标签页",
+            Self::CloseTab => "关闭标签页",
+            Self::Delete => "删除",
+            Self::Rename => "重命名",
+            Self::Copy => "复制",
+            Self::Cut => "剪切",
+            Self::Paste => "粘贴",
+            Self::NewFile => "新建文件",
+            Self::NewDir => "新建文件夹",
+        }
+    }
+
+    fn shortcut<'a>(self, shortcuts: &'a settings::ShortcutSettings) -> &'a str {
+        match self {
+            Self::Open => &shortcuts.open,
+            Self::Search => &shortcuts.search,
+            Self::NewTab => &shortcuts.new_tab,
+            Self::CloseTab => &shortcuts.close_tab,
+            Self::Delete => &shortcuts.delete,
+            Self::Rename => &shortcuts.rename,
+            Self::Copy => &shortcuts.copy,
+            Self::Cut => &shortcuts.cut,
+            Self::Paste => &shortcuts.paste,
+            Self::NewFile => &shortcuts.new_file,
+            Self::NewDir => &shortcuts.new_dir,
+        }
+    }
+
+    fn set_shortcut(self, shortcuts: &mut settings::ShortcutSettings, value: String) {
+        match self {
+            Self::Open => shortcuts.open = value,
+            Self::Search => shortcuts.search = value,
+            Self::NewTab => shortcuts.new_tab = value,
+            Self::CloseTab => shortcuts.close_tab = value,
+            Self::Delete => shortcuts.delete = value,
+            Self::Rename => shortcuts.rename = value,
+            Self::Copy => shortcuts.copy = value,
+            Self::Cut => shortcuts.cut = value,
+            Self::Paste => shortcuts.paste = value,
+            Self::NewFile => shortcuts.new_file = value,
+            Self::NewDir => shortcuts.new_dir = value,
+        }
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            Self::Open => "shortcut-open",
+            Self::Search => "shortcut-search",
+            Self::NewTab => "shortcut-new-tab",
+            Self::CloseTab => "shortcut-close-tab",
+            Self::Delete => "shortcut-delete",
+            Self::Rename => "shortcut-rename",
+            Self::Copy => "shortcut-copy",
+            Self::Cut => "shortcut-cut",
+            Self::Paste => "shortcut-paste",
+            Self::NewFile => "shortcut-new-file",
+            Self::NewDir => "shortcut-new-dir",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SortField {
+    Name,
+    Modified,
+    Size,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SortDirection {
+    Ascending,
+    Descending,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SortState {
+    field: SortField,
+    direction: SortDirection,
+}
+
+impl Default for SortState {
+    fn default() -> Self {
+        Self {
+            field: SortField::Name,
+            direction: SortDirection::Ascending,
+        }
+    }
 }
 
 /// 一个标签页：独立的工作目录 + 文件列表 + 选中态。
@@ -82,10 +272,21 @@ struct Tab {
     files: Vec<FileEntry>,
     /// 选中的文件名（单选时含 1 个，多选时多个）。
     selected: Vec<String>,
-    /// Shift 范围选择的锚点（文件在 files 中的下标）。
-    anchor: Option<usize>,
+    /// Shift 范围选择的锚点文件名，避免排序后索引失效。
+    anchor: Option<String>,
+    /// 当前标签页的列表排序方式。
+    sort: SortState,
     /// 是否处于「此电脑」虚拟视图（列出所有磁盘，不经过 yazi）。
     computer_view: bool,
+    refreshing: bool,
+}
+
+struct SearchState {
+    cwd: String,
+    query: String,
+    results: Vec<FileEntry>,
+    generation: u64,
+    scanning: bool,
 }
 
 impl Tab {
@@ -95,7 +296,9 @@ impl Tab {
             files: Vec::new(),
             selected: Vec::new(),
             anchor: None,
+            sort: SortState::default(),
             computer_view: false,
+            refreshing: false,
         }
     }
 }
@@ -111,6 +314,54 @@ struct MenuState {
     /// 右键命中的文件/目录名（None = 空白处）。
     target: Option<String>,
     position: Point<Pixels>,
+}
+
+struct PendingDelete {
+    cwd: String,
+    paths: Vec<String>,
+    network_count: usize,
+}
+
+#[derive(Clone, Copy)]
+enum DeleteMode {
+    RecycleBin,
+    Permanent,
+}
+
+struct DeleteSummary {
+    success: usize,
+    failed: usize,
+    permanent_success: usize,
+    first_failure: Option<String>,
+}
+
+struct TransferProgress {
+    completed_bytes: u64,
+    total_bytes: u64,
+    completed_items: usize,
+    total_items: usize,
+    current: String,
+}
+
+struct TransferState {
+    progress: TransferProgress,
+    cancel: Arc<AtomicBool>,
+}
+
+enum TransferOutcome {
+    Completed { success: usize },
+    Cancelled { success: usize },
+    Failed { success: usize, message: String },
+}
+
+enum TransferUpdate {
+    Progress {
+        total_bytes: u64,
+        completed_bytes: u64,
+        completed_items: usize,
+        current: String,
+    },
+    Finished(TransferOutcome),
 }
 
 /// 右键菜单项。
@@ -130,32 +381,98 @@ struct Root {
     client: Option<YaziClient>,
     tabs: Vec<Tab>,
     active: usize,
+    drive_roots: Vec<String>,
     clipboard: Option<Clipboard>,
+    transfer: Option<TransferState>,
+    pending_delete: Option<PendingDelete>,
+    delete_in_progress: bool,
     menu: Option<MenuState>,
     preview: Preview,
     preview_path: Option<String>,
     focus_handle: FocusHandle,
+    input_blur_subscription: Option<Subscription>,
     pending: Option<PendingOp>,
     input: String,
+    input_selection: Range<usize>,
+    selection_reversed: bool,
+    marked_range: Option<Range<usize>>,
+    input_layout: Option<ShapedLine>,
+    input_bounds: Option<Bounds<Pixels>>,
+    input_selecting: bool,
+    status: Option<String>,
     theme: Theme,
+    settings: AppSettings,
+    page: Page,
+    tray: Option<TrayController>,
+    window_handle: Option<AnyWindowHandle>,
+    close_requested: bool,
+    next_refresh_id: u64,
+    drive_scan_id: u64,
+    search: Option<SearchState>,
+    search_generation: u64,
+    shortcuts_expanded: bool,
 }
 
 impl Root {
     fn new(cx: &mut Context<Self>) -> Self {
+        let settings = load_settings_or_exit();
+        let theme = match settings.theme {
+            ThemeMode::Dark => Theme::dark(),
+            ThemeMode::Light => Theme::light(),
+        };
+        let (tray, mut tray_rx) = match TrayController::new(settings.language) {
+            Ok((tray, rx)) => (Some(tray), Some(rx)),
+            Err(error) => {
+                eprintln!("[yazi-gui] tray unavailable: {error}");
+                (None, None)
+            }
+        };
         let mut root = Self {
             client: None,
             tabs: vec![Tab::new(START_DIR)],
             active: 0,
+            drive_roots: Vec::new(),
             clipboard: None,
+            transfer: None,
+            pending_delete: None,
+            delete_in_progress: false,
             menu: None,
             preview: Preview::Empty,
             preview_path: None,
             focus_handle: cx.focus_handle(),
+            input_blur_subscription: None,
             pending: None,
             input: String::new(),
-            theme: Theme::dark(),
+            input_selection: 0..0,
+            selection_reversed: false,
+            marked_range: None,
+            input_layout: None,
+            input_bounds: None,
+            input_selecting: false,
+            status: None,
+            theme,
+            settings,
+            page: Page::Files,
+            tray,
+            window_handle: None,
+            close_requested: false,
+            next_refresh_id: 0,
+            drive_scan_id: 0,
+            search: None,
+            search_generation: 0,
+            shortcuts_expanded: false,
         };
+        if let Some(mut rx) = tray_rx.take() {
+            cx.spawn(async move |weak, cx| {
+                while let Some(command) = rx.recv().await {
+                    weak.update(cx, |this, cx| this.handle_tray_command(command, cx))
+                        .ok();
+                }
+            })
+            .detach();
+        }
         root.start_yazi(cx);
+        root.start_drive_scan(cx, false);
         root
     }
 
@@ -165,6 +482,456 @@ impl Root {
 
     fn cur_mut(&mut self) -> &mut Tab {
         &mut self.tabs[self.active]
+    }
+
+    fn visible_files(&self) -> &[FileEntry] {
+        self.search
+            .as_ref()
+            .map(|search| search.results.as_slice())
+            .unwrap_or_else(|| self.cur().files.as_slice())
+    }
+
+    fn is_inline_editing(&self) -> bool {
+        matches!(
+            self.pending,
+            Some(PendingOp::Rename { .. } | PendingOp::NewFile | PendingOp::NewDir)
+        )
+    }
+
+    fn reset_input_editor(&mut self, text: String, select_all: bool) {
+        let end = text.len();
+        self.input = text;
+        self.input_selection = if select_all { 0..end } else { end..end };
+        self.selection_reversed = false;
+        self.marked_range = None;
+        self.input_layout = None;
+        self.input_bounds = None;
+        self.input_selecting = false;
+    }
+
+    fn clear_input_editor(&mut self) {
+        self.reset_input_editor(String::new(), false);
+    }
+
+    fn cancel_input_state(&mut self) {
+        self.pending = None;
+        self.search_generation = self.search_generation.wrapping_add(1);
+        self.search = None;
+        self.clear_input_editor();
+    }
+
+    fn set_status(&mut self, status: impl Into<String>) {
+        self.status = Some(settings::translate_status(self.language(), &status.into()));
+    }
+
+    fn clear_status(&mut self) {
+        self.status = None;
+    }
+
+    fn language(&self) -> Language {
+        self.settings.language
+    }
+
+    fn tr(&self, text: &str) -> String {
+        settings::translate(self.language(), text)
+    }
+
+    fn persist_settings(&mut self, cx: &mut Context<Self>) {
+        if let Err(error) = settings::save(&self.settings) {
+            self.set_status(format!("{}: {}", self.tr("保存失败"), error));
+        }
+        cx.notify();
+    }
+
+    fn set_theme_mode(&mut self, theme: ThemeMode, cx: &mut Context<Self>) {
+        self.settings.theme = theme;
+        self.theme = match theme {
+            ThemeMode::Dark => Theme::dark(),
+            ThemeMode::Light => Theme::light(),
+        };
+        self.persist_settings(cx);
+    }
+
+    fn show_files(&mut self, cx: &mut Context<Self>) {
+        self.page = Page::Files;
+        cx.notify();
+    }
+
+    fn show_settings(&mut self, cx: &mut Context<Self>) {
+        self.cancel_input_state();
+        self.menu = None;
+        self.page = Page::Settings;
+        cx.notify();
+    }
+
+    fn handle_tray_command(&mut self, command: TrayCommand, cx: &mut Context<Self>) {
+        match command {
+            TrayCommand::Show => {
+                self.show_native_window(cx);
+                cx.notify();
+            }
+            TrayCommand::Settings => {
+                self.show_native_window(cx);
+                self.show_settings(cx);
+            }
+            TrayCommand::Exit => {
+                if self.has_active_work() {
+                    self.set_status(self.tr("正在进行文件操作，请完成后再退出"));
+                    cx.notify();
+                } else {
+                    self.close_requested = true;
+                    cx.quit();
+                }
+            }
+        }
+    }
+
+    fn has_active_work(&self) -> bool {
+        self.transfer.is_some()
+            || self.delete_in_progress
+            || self.tabs.iter().any(|tab| tab.refreshing)
+    }
+
+    fn handle_window_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.close_requested {
+            return true;
+        }
+        if self.has_active_work() {
+            let message = if self.tabs.iter().any(|tab| tab.refreshing) {
+                self.tr("正在刷新，请完成后再退出")
+            } else {
+                self.tr("正在进行文件操作，请完成后再退出")
+            };
+            self.set_status(message);
+            cx.notify();
+            return false;
+        }
+        if self.tray.is_none() {
+            return true;
+        }
+        self.hide_native_window(window);
+        false
+    }
+
+    #[cfg(windows)]
+    fn window_hwnd(window: &Window) -> Option<windows_sys::Win32::Foundation::HWND> {
+        match HasWindowHandle::window_handle(window).ok()?.as_raw() {
+            RawWindowHandle::Win32(handle) => Some(handle.hwnd.get() as *mut std::ffi::c_void),
+            _ => None,
+        }
+    }
+
+    #[cfg(windows)]
+    fn hide_native_window(&self, window: &Window) {
+        if let Some(hwnd) = Self::window_hwnd(window) {
+            unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
+                    hwnd,
+                    windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE,
+                );
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn hide_native_window(&self, _window: &Window) {}
+
+    fn show_native_window(&self, cx: &mut Context<Self>) {
+        let Some(handle) = self.window_handle else {
+            return;
+        };
+        let _ = handle.update(cx, |_, window, _| {
+            #[cfg(windows)]
+            if let Some(hwnd) = Root::window_hwnd(window) {
+                unsafe {
+                    windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
+                        hwnd,
+                        windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW,
+                    );
+                    windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
+                }
+            }
+            #[cfg(not(windows))]
+            window.activate_window();
+        });
+    }
+
+    fn input_cursor_offset(&self) -> usize {
+        if self.selection_reversed {
+            self.input_selection.start
+        } else {
+            self.input_selection.end
+        }
+    }
+
+    fn move_input_cursor(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let offset = offset.min(self.input.len());
+        self.input_selection = offset..offset;
+        self.selection_reversed = false;
+        cx.notify();
+    }
+
+    fn select_input_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let offset = offset.min(self.input.len());
+        if self.selection_reversed {
+            self.input_selection.start = offset;
+        } else {
+            self.input_selection.end = offset;
+        }
+        if self.input_selection.end < self.input_selection.start {
+            self.selection_reversed = !self.selection_reversed;
+            self.input_selection = self.input_selection.end..self.input_selection.start;
+        }
+        cx.notify();
+    }
+
+    fn previous_input_boundary(&self, offset: usize) -> usize {
+        self.input
+            .grapheme_indices(true)
+            .rev()
+            .find_map(|(index, _)| (index < offset).then_some(index))
+            .unwrap_or(0)
+    }
+
+    fn next_input_boundary(&self, offset: usize) -> usize {
+        self.input
+            .grapheme_indices(true)
+            .find_map(|(index, _)| (index > offset).then_some(index))
+            .unwrap_or(self.input.len())
+    }
+
+    fn input_offset_to_utf16(&self, offset: usize) -> usize {
+        self.input[..offset.min(self.input.len())]
+            .chars()
+            .map(char::len_utf16)
+            .sum()
+    }
+
+    fn input_offset_from_utf16(&self, offset: usize) -> usize {
+        let mut utf8_offset = 0;
+        let mut utf16_count = 0;
+        for ch in self.input.chars() {
+            if utf16_count >= offset {
+                break;
+            }
+            utf16_count += ch.len_utf16();
+            utf8_offset += ch.len_utf8();
+        }
+        utf8_offset.min(self.input.len())
+    }
+
+    fn input_range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
+        self.input_offset_to_utf16(range.start)..self.input_offset_to_utf16(range.end)
+    }
+
+    fn input_range_from_utf16(&self, range: &Range<usize>) -> Range<usize> {
+        self.input_offset_from_utf16(range.start)..self.input_offset_from_utf16(range.end)
+    }
+
+    fn replace_input_range(&mut self, range: Range<usize>, text: &str, cx: &mut Context<Self>) {
+        let range = range.start.min(self.input.len())..range.end.min(self.input.len());
+        self.input.replace_range(range.clone(), text);
+        let cursor = range.start + text.len();
+        self.input_selection = cursor..cursor;
+        self.selection_reversed = false;
+        self.marked_range = None;
+        if matches!(self.pending, Some(PendingOp::Search)) {
+            self.update_search_query(cx);
+        }
+        cx.notify();
+    }
+
+    fn replace_current_input(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.replace_input_range(self.input_selection.clone(), text, cx);
+    }
+
+    fn input_byte_index_for_point(&self, point: Point<Pixels>) -> Option<usize> {
+        let bounds = self.input_bounds.as_ref()?;
+        let line = self.input_layout.as_ref()?;
+        let local = bounds.localize(&point)?;
+        Some(line.closest_index_for_x(local.x).min(self.input.len()))
+    }
+
+    fn input_backspace(&mut self, _: &Backspace, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.input_selection.is_empty() {
+            let cursor = self.input_cursor_offset();
+            if cursor == 0 {
+                return;
+            }
+            self.input_selection = self.previous_input_boundary(cursor)..cursor;
+        }
+        self.replace_current_input("", cx);
+    }
+
+    fn input_delete(&mut self, _: &Delete, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.input_selection.is_empty() {
+            let cursor = self.input_cursor_offset();
+            if cursor == self.input.len() {
+                return;
+            }
+            self.input_selection = cursor..self.next_input_boundary(cursor);
+        }
+        self.replace_current_input("", cx);
+    }
+
+    fn input_left(&mut self, _: &Left, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.input_selection.is_empty() {
+            self.move_input_cursor(self.previous_input_boundary(self.input_cursor_offset()), cx);
+        } else {
+            self.move_input_cursor(self.input_selection.start, cx);
+        }
+    }
+
+    fn input_right(&mut self, _: &Right, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.input_selection.is_empty() {
+            self.move_input_cursor(self.next_input_boundary(self.input_cursor_offset()), cx);
+        } else {
+            self.move_input_cursor(self.input_selection.end, cx);
+        }
+    }
+
+    fn input_select_left(&mut self, _: &SelectLeft, _window: &mut Window, cx: &mut Context<Self>) {
+        self.select_input_to(self.previous_input_boundary(self.input_cursor_offset()), cx);
+    }
+
+    fn input_select_right(
+        &mut self,
+        _: &SelectRight,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_input_to(self.next_input_boundary(self.input_cursor_offset()), cx);
+    }
+
+    fn input_select_all(&mut self, _: &SelectAll, _window: &mut Window, cx: &mut Context<Self>) {
+        self.input_selection = 0..self.input.len();
+        self.selection_reversed = false;
+        cx.notify();
+    }
+
+    fn input_home(&mut self, _: &Home, _window: &mut Window, cx: &mut Context<Self>) {
+        self.move_input_cursor(0, cx);
+    }
+
+    fn input_end(&mut self, _: &End, _window: &mut Window, cx: &mut Context<Self>) {
+        self.move_input_cursor(self.input.len(), cx);
+    }
+
+    fn input_paste(&mut self, _: &PasteText, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            self.set_status("剪贴板为空或不含文本");
+            cx.notify();
+            return;
+        };
+        let text = if matches!(self.pending.as_ref(), Some(PendingOp::GoToPath)) {
+            match normalize_single_path(&text) {
+                Ok(path) => path,
+                Err(message) => {
+                    self.set_status(message);
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            text.replace('\r', " ").replace('\n', " ")
+        };
+        self.replace_current_input(&text, cx);
+    }
+
+    fn input_copy(&mut self, _: &CopyText, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.input_selection.is_empty() {
+            return;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(
+            self.input[self.input_selection.clone()].to_string(),
+        ));
+    }
+
+    fn input_cut(&mut self, _: &CutText, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.input_selection.is_empty() {
+            return;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(
+            self.input[self.input_selection.clone()].to_string(),
+        ));
+        self.replace_current_input("", cx);
+    }
+
+    fn input_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus_handle.focus(window);
+        self.input_selecting = true;
+        let offset = self.input_byte_index_for_point(event.position).unwrap_or(0);
+        if event.modifiers.shift {
+            self.select_input_to(offset, cx);
+        } else {
+            self.move_input_cursor(offset, cx);
+        }
+    }
+
+    fn input_mouse_up(&mut self, _: &MouseUpEvent, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.input_selecting = false;
+    }
+
+    fn input_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.input_selecting {
+            if let Some(offset) = self.input_byte_index_for_point(event.position) {
+                self.select_input_to(offset, cx);
+            }
+        }
+    }
+
+    fn start_drive_scan(&mut self, cx: &mut Context<Self>, mark_refresh: bool) {
+        let active = self.active;
+        self.drive_scan_id = self.drive_scan_id.wrapping_add(1);
+        let scan_id = self.drive_scan_id;
+        if mark_refresh {
+            self.tabs[active].refreshing = true;
+            self.set_status(self.tr("正在刷新..."));
+        }
+        cx.spawn(async move |weak, cx| {
+            let drives = cx
+                .background_executor()
+                .spawn(async move { scan_drives() })
+                .await;
+            weak.update(cx, |this, cx| {
+                if this.drive_scan_id != scan_id {
+                    return;
+                }
+                this.drive_roots = drives;
+                let names = this.drive_roots.clone();
+                for tab in &mut this.tabs {
+                    if !tab.computer_view {
+                        continue;
+                    }
+                    reconcile_selection(&mut tab.selected, &mut tab.anchor, &names);
+                    if mark_refresh {
+                        tab.refreshing = false;
+                    }
+                }
+                if mark_refresh && this.active == active {
+                    this.set_status(format!(
+                        "{}，{} {}",
+                        this.tr("已刷新"),
+                        this.drive_roots.len(),
+                        this.tr("个磁盘")
+                    ));
+                }
+                this.reconcile_preview();
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn start_yazi(&mut self, cx: &mut Context<Self>) {
@@ -191,20 +958,81 @@ impl Root {
     fn on_event(&mut self, event: YaziEvent, cx: &mut Context<Self>) {
         match event {
             YaziEvent::Cd { url, .. } => {
-                if let Some(u) = url {
-                    self.cur_mut().cwd = u;
-                    // 收到 cd 事件说明 yazi 已切目录，离开「此电脑」视图
+                if !self.cur().computer_view {
+                    if let Some(u) = url {
+                        self.cur_mut().cwd = u;
+                    }
                     self.cur_mut().computer_view = false;
+                    self.cur_mut().refreshing = false;
                 }
             }
             YaziEvent::Hover { .. } => {}
             YaziEvent::GuiFiles { cwd, files, .. } => {
-                self.cur_mut().cwd = cwd;
-                self.cur_mut().files = files;
+                if !self.cur().computer_view {
+                    let search_active = self.search.is_some();
+                    let refreshed = {
+                        let tab = self.cur_mut();
+                        let refreshed = refresh_request_matches(tab.refreshing, &tab.cwd, &cwd);
+                        tab.cwd = cwd;
+                        tab.files = files;
+                        sort_files(&mut tab.files, tab.sort);
+                        let names = tab
+                            .files
+                            .iter()
+                            .map(|file| file.name.clone())
+                            .collect::<Vec<_>>();
+                        if refreshed {
+                            tab.refreshing = false;
+                        }
+                        (refreshed, names)
+                    };
+                    if !search_active {
+                        let tab = self.cur_mut();
+                        reconcile_selection(&mut tab.selected, &mut tab.anchor, &refreshed.1);
+                    }
+                    if refreshed.0 {
+                        self.set_status(format!(
+                            "{}，{} {}",
+                            self.tr("已刷新"),
+                            self.cur().files.len(),
+                            self.tr("项")
+                        ));
+                    }
+                    self.reconcile_preview();
+                }
             }
             _ => {}
         }
         let _ = cx;
+    }
+
+    fn reconcile_preview(&mut self) {
+        let expected = {
+            let tab = self.cur();
+            if tab.selected.len() != 1 {
+                None
+            } else if tab.computer_view {
+                Some(
+                    PathBuf::from(&tab.selected[0])
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+            } else {
+                Some(
+                    Path::new(&tab.cwd)
+                        .join(&tab.selected[0])
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+            }
+        };
+        let valid = expected.as_deref().is_some_and(|path| {
+            self.preview_path.as_deref() == Some(path) && Path::new(path).exists()
+        });
+        if !valid {
+            self.preview = Preview::Empty;
+            self.preview_path = None;
+        }
     }
 
     // ---- 选中模型 ----
@@ -212,9 +1040,7 @@ impl Root {
     fn select_single(&mut self, name: &str) {
         let tab = self.cur_mut();
         tab.selected = vec![name.to_string()];
-        if let Some(ix) = tab.files.iter().position(|f| f.name == name) {
-            tab.anchor = Some(ix);
-        }
+        tab.anchor = Some(name.to_string());
     }
 
     fn toggle_select(&mut self, name: &str) {
@@ -224,24 +1050,63 @@ impl Root {
         } else {
             tab.selected.push(name.to_string());
         }
-        if let Some(ix) = tab.files.iter().position(|f| f.name == name) {
-            tab.anchor = Some(ix);
-        }
+        tab.anchor = Some(name.to_string());
     }
 
     fn range_select(&mut self, name: &str) {
+        let visible_names: Vec<String> = self
+            .visible_files()
+            .iter()
+            .map(|file| file.name.clone())
+            .collect();
         let tab = self.cur_mut();
-        let Some(end) = tab.files.iter().position(|f| f.name == name) else {
+        let Some(end) = visible_names.iter().position(|item| item == name) else {
             return;
         };
-        let start = tab.anchor.unwrap_or(end);
-        let (lo, hi) = if start <= end { (start, end) } else { (end, start) };
-        let names: Vec<String> = tab.files[lo..=hi].iter().map(|f| f.name.clone()).collect();
-        tab.selected = names;
+        let start = tab
+            .anchor
+            .as_deref()
+            .and_then(|anchor| visible_names.iter().position(|item| item == anchor))
+            .unwrap_or(end);
+        let (lo, hi) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        tab.selected = visible_names[lo..=hi].to_vec();
     }
 
     fn clear_selection(&mut self) {
-        self.cur_mut().selected.clear();
+        let tab = self.cur_mut();
+        tab.selected.clear();
+        tab.anchor = None;
+    }
+
+    fn toggle_sort(&mut self, field: SortField, cx: &mut Context<Self>) {
+        if self.is_inline_editing() {
+            self.confirm_input(cx);
+        }
+        let sort = {
+            let tab = self.cur_mut();
+            if tab.sort.field == field {
+                tab.sort.direction = match tab.sort.direction {
+                    SortDirection::Ascending => SortDirection::Descending,
+                    SortDirection::Descending => SortDirection::Ascending,
+                };
+            } else {
+                tab.sort = SortState {
+                    field,
+                    direction: SortDirection::Ascending,
+                };
+            }
+            tab.sort
+        };
+        if let Some(search) = self.search.as_mut() {
+            sort_files(&mut search.results, sort);
+        } else {
+            sort_files(&mut self.cur_mut().files, sort);
+        }
+        cx.notify();
     }
 
     /// 单击/双击文件行的统一入口。
@@ -253,6 +1118,12 @@ impl Root {
         click_count: usize,
         cx: &mut Context<Self>,
     ) {
+        if self.is_inline_editing() {
+            self.confirm_input(cx);
+        } else if !matches!(self.pending, Some(PendingOp::Search)) {
+            self.cancel_input_state();
+        }
+        self.clear_status();
         if click_count >= 2 {
             if is_dir {
                 self.enter(name);
@@ -274,6 +1145,14 @@ impl Root {
 
     /// 点击空白处：取消选中。
     fn click_blank(&mut self, cx: &mut Context<Self>) {
+        if self.is_inline_editing() {
+            self.confirm_input(cx);
+            return;
+        }
+        if !matches!(self.pending, Some(PendingOp::Search)) {
+            self.cancel_input_state();
+        }
+        self.clear_status();
         self.clear_selection();
         self.preview = Preview::Empty;
         self.preview_path = None;
@@ -287,8 +1166,8 @@ impl Root {
             let count = tab.selected.len();
             if count == 1 {
                 let name = tab.selected[0].clone();
-                let (is_dir, size) = tab
-                    .files
+                let (is_dir, size) = self
+                    .visible_files()
                     .iter()
                     .find(|f| f.name == name)
                     .map(|f| (f.is_dir, f.size))
@@ -362,16 +1241,102 @@ impl Root {
 
     // ---- 基础导航与操作 ----
 
+    fn send_checked(&self, action: &[&str]) -> anyhow::Result<()> {
+        let client = self
+            .client
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("yazi client unavailable"))?;
+        client.send(action).map(|_| ())
+    }
+
     fn send(&self, action: &[&str]) {
-        if let Some(client) = &self.client {
-            let _ = client.send(action);
+        let _ = self.send_checked(action);
+    }
+
+    fn refresh_current(&mut self, cx: &mut Context<Self>) {
+        self.cancel_input_state();
+        self.menu = None;
+        if self.pending_delete.is_some() {
+            return;
         }
+        if self.transfer.is_some() {
+            self.set_status("粘贴进行中，暂不能刷新");
+            cx.notify();
+            return;
+        }
+        if self.delete_in_progress {
+            self.set_status("删除进行中，暂不能刷新");
+            cx.notify();
+            return;
+        }
+        self.clear_status();
+
+        if self.cur().computer_view {
+            if self.cur().refreshing {
+                self.set_status(self.tr("正在刷新..."));
+                cx.notify();
+                return;
+            }
+            self.start_drive_scan(cx, true);
+            cx.notify();
+            return;
+        }
+
+        if self.cur().refreshing {
+            self.set_status(self.tr("正在刷新..."));
+            cx.notify();
+            return;
+        }
+        let tab_index = self.active;
+        let cwd = self.cur().cwd.clone();
+        let Some(client_id) = self
+            .client
+            .as_ref()
+            .map(|client| client.client_id().to_string())
+        else {
+            self.set_status(self.tr("刷新失败: yazi client unavailable"));
+            cx.notify();
+            return;
+        };
+        self.next_refresh_id = self.next_refresh_id.wrapping_add(1);
+        let request_id = self.next_refresh_id;
+        self.cur_mut().refreshing = true;
+        self.set_status(self.tr("正在刷新..."));
+        cx.spawn(async move |weak, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    YaziClient::send_with_client_id(&client_id, &["cd".to_string(), cwd.clone()])
+                })
+                .await;
+            weak.update(cx, |this, cx| {
+                if this.next_refresh_id != request_id || tab_index >= this.tabs.len() {
+                    return;
+                }
+                this.tabs[tab_index].refreshing = false;
+                if this.active == tab_index {
+                    match result {
+                        Ok(_) => this.set_status(this.tr("已刷新")),
+                        Err(error) => {
+                            this.set_status(format!("{}: {}", this.tr("刷新失败"), error))
+                        }
+                    }
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
     }
 
     fn enter(&mut self, name: &str) {
+        self.cancel_input_state();
+        self.clear_status();
         if self.cur().computer_view {
             // 点击盘符：进入该磁盘根目录
             self.cur_mut().computer_view = false;
+            self.cur_mut().refreshing = false;
             self.cur_mut().cwd = name.to_string();
             self.cur_mut().selected.clear();
             self.cur_mut().anchor = None;
@@ -380,11 +1345,27 @@ impl Root {
             self.send(&["cd", name]);
             return;
         }
+        self.cur_mut().refreshing = false;
         let path = std::path::Path::new(&self.cur().cwd).join(name);
         self.send(&["cd", &path.to_string_lossy()]);
     }
 
-    fn go_parent(&mut self) {
+    fn show_computer_view(&mut self, cx: &mut Context<Self>) {
+        self.cancel_input_state();
+        self.clear_status();
+        self.menu = None;
+        self.cur_mut().computer_view = true;
+        self.cur_mut().selected.clear();
+        self.cur_mut().anchor = None;
+        self.preview = Preview::Empty;
+        self.preview_path = None;
+        self.start_drive_scan(cx, true);
+        cx.notify();
+    }
+
+    fn go_parent(&mut self, cx: &mut Context<Self>) {
+        self.cancel_input_state();
+        self.clear_status();
         if self.cur().computer_view {
             return; // 已在「此电脑」顶层
         }
@@ -395,8 +1376,11 @@ impl Root {
             self.cur_mut().anchor = None;
             self.preview = Preview::Empty;
             self.preview_path = None;
+            self.start_drive_scan(cx, true);
+            cx.notify();
             return;
         }
+        self.cur_mut().refreshing = false;
         self.send(&["cd", ".."]);
     }
 
@@ -416,8 +1400,12 @@ impl Root {
     }
 
     fn open_selected(&mut self, cx: &mut Context<Self>) {
+        self.cancel_input_state();
+        self.clear_status();
         let tab = self.cur();
         let Some(name) = tab.selected.first().cloned() else {
+            self.set_status("未选择项目");
+            cx.notify();
             return;
         };
         if tab.computer_view {
@@ -432,8 +1420,26 @@ impl Root {
         }
     }
 
-    fn delete_selected(&self, cx: &mut Context<Self>) {
+    fn delete_selected(&mut self, cx: &mut Context<Self>) {
+        self.cancel_input_state();
+        self.clear_status();
+        self.menu = None;
+        if self.pending_delete.is_some() {
+            return;
+        }
+        if self.transfer.is_some() {
+            self.set_status("粘贴进行中，暂不能删除");
+            cx.notify();
+            return;
+        }
+        if self.delete_in_progress {
+            self.set_status("删除进行中");
+            cx.notify();
+            return;
+        }
         if self.cur().computer_view {
+            self.set_status("此电脑视图不可删除");
+            cx.notify();
             return;
         }
         let cwd = self.cur().cwd.clone();
@@ -449,31 +1455,66 @@ impl Root {
             })
             .collect();
         if paths.is_empty() {
+            self.set_status("未选择项目");
+            cx.notify();
             return;
         }
-        cx.spawn(async move |weak, cx| {
-            let paths2 = paths.clone();
-            let ok = cx
-                .background_executor()
-                .spawn(async move {
-                    let mut all = true;
-                    for p in &paths2 {
-                        if trash::delete(p).is_err() {
-                            all = false;
-                        }
-                    }
-                    all
-                })
-                .await;
-            if ok {
-                let cwd2 = cwd.clone();
-                weak.update(cx, |this, _cx| {
-                    this.send(&["cd", cwd2.as_str()]);
-                })
-                .ok();
+
+        let network_count = match network_path_count(&paths) {
+            Ok(count) => count,
+            Err(message) => {
+                self.set_status(message);
+                cx.notify();
+                return;
             }
+        };
+        if network_count > 0 {
+            self.pending_delete = Some(PendingDelete {
+                cwd,
+                paths,
+                network_count,
+            });
+            cx.notify();
+            return;
+        }
+        self.start_delete_operation(cwd, paths, cx);
+    }
+
+    fn start_delete_operation(&mut self, cwd: String, paths: Vec<String>, cx: &mut Context<Self>) {
+        let count = paths.len();
+        self.delete_in_progress = true;
+        self.set_status(format!("正在删除 {} 项...", count));
+        cx.notify();
+        cx.spawn(async move |weak, cx| {
+            let summary = cx
+                .background_executor()
+                .spawn(async move { delete_paths_with_policy(&paths) })
+                .await;
+            weak.update(cx, |this, cx| {
+                this.delete_in_progress = false;
+                if summary.success > 0 && this.cur().cwd == cwd && !this.cur().computer_view {
+                    this.send(&["cd", cwd.as_str()]);
+                }
+                this.set_status(delete_status(&summary));
+                cx.notify();
+            })
+            .ok();
         })
         .detach();
+    }
+
+    fn confirm_delete(&mut self, cx: &mut Context<Self>) {
+        let Some(request) = self.pending_delete.take() else {
+            return;
+        };
+        self.start_delete_operation(request.cwd, request.paths, cx);
+    }
+
+    fn cancel_delete_confirmation(&mut self, cx: &mut Context<Self>) {
+        if self.pending_delete.take().is_some() {
+            self.set_status("已取消删除");
+            cx.notify();
+        }
     }
 
     fn selected_paths(&self) -> Vec<String> {
@@ -491,67 +1532,216 @@ impl Root {
     }
 
     fn copy_selected(&mut self, cx: &mut Context<Self>) {
-        let paths = self.selected_paths();
-        if paths.is_empty() {
+        self.cancel_input_state();
+        self.clear_status();
+        if self.transfer.is_some() {
+            self.set_status("粘贴进行中，暂不能修改文件剪贴板");
+            cx.notify();
             return;
         }
+        if self.cur().computer_view {
+            self.set_status("此电脑视图不可复制");
+            cx.notify();
+            return;
+        }
+        let paths = self.selected_paths();
+        if paths.is_empty() {
+            self.set_status("未选择项目");
+            cx.notify();
+            return;
+        }
+        let count = paths.len();
         self.clipboard = Some(Clipboard { paths, cut: false });
+        self.set_status(format!("已复制 {} 项", count));
         cx.notify();
     }
 
     fn cut_selected(&mut self, cx: &mut Context<Self>) {
-        let paths = self.selected_paths();
-        if paths.is_empty() {
+        self.cancel_input_state();
+        self.clear_status();
+        if self.transfer.is_some() {
+            self.set_status("粘贴进行中，暂不能修改文件剪贴板");
+            cx.notify();
             return;
         }
+        if self.cur().computer_view {
+            self.set_status("此电脑视图不可剪切");
+            cx.notify();
+            return;
+        }
+        let paths = self.selected_paths();
+        if paths.is_empty() {
+            self.set_status("未选择项目");
+            cx.notify();
+            return;
+        }
+        let count = paths.len();
         self.clipboard = Some(Clipboard { paths, cut: true });
+        self.set_status(format!("已剪切 {} 项", count));
         cx.notify();
     }
 
-    fn paste_clipboard(&self, cx: &mut Context<Self>) {
-        let Some(clip) = &self.clipboard else { return };
-        let dest = self.cur().cwd.clone();
+    fn paste_clipboard(&mut self, cx: &mut Context<Self>) {
+        self.cancel_input_state();
+        self.clear_status();
+        if self.transfer.is_some() {
+            self.set_status("已有粘贴操作正在进行");
+            cx.notify();
+            return;
+        }
+        if self.cur().computer_view {
+            self.set_status("此电脑视图不可粘贴");
+            cx.notify();
+            return;
+        }
+        let Some(clip) = &self.clipboard else {
+            self.set_status("文件剪贴板为空");
+            cx.notify();
+            return;
+        };
         let paths = clip.paths.clone();
         let cut = clip.cut;
-        cx.spawn(async move |weak, cx| {
-            let dest2 = dest.clone();
-            let paths2 = paths.clone();
-            let ok = cx
-                .background_executor()
-                .spawn(async move {
-                    let mut all = true;
-                    for src in &paths2 {
-                        let name = file_name_of(src);
-                        let dst = std::path::Path::new(&dest2).join(&name);
-                        let r = if cut {
-                            std::fs::rename(src, &dst)
-                        } else if std::path::Path::new(src).is_dir() {
-                            copy_dir_recursive(src, &dst)
-                        } else {
-                            std::fs::copy(src, &dst).map(|_| ())
-                        };
-                        if r.is_err() {
-                            all = false;
+        let count = paths.len();
+
+        if cut {
+            let dest = self.cur().cwd.clone();
+            self.set_status(format!("正在粘贴 {} 项...", count));
+            cx.notify();
+            cx.spawn(async move |weak, cx| {
+                let dest2 = dest.clone();
+                let paths2 = paths.clone();
+                let (success, failed) = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let mut success = 0usize;
+                        let mut failed = 0usize;
+                        for src in &paths2 {
+                            let name = file_name_of(src);
+                            let dst = Path::new(&dest2).join(&name);
+                            if fs::rename(src, &dst).is_ok() {
+                                success += 1;
+                            } else {
+                                failed += 1;
+                            }
                         }
-                    }
-                    all
-                })
-                .await;
-            if ok {
-                let dest3 = dest.clone();
-                weak.update(cx, |this, _cx| {
-                    if cut {
+                        (success, failed)
+                    })
+                    .await;
+                weak.update(cx, |this, cx| {
+                    if failed == 0 {
                         this.clipboard = None;
                     }
-                    this.send(&["cd", dest3.as_str()]);
+                    if success > 0 && this.cur().cwd == dest {
+                        this.send(&["cd", dest.as_str()]);
+                    }
+                    this.set_status(operation_status("粘贴", success, failed));
+                    cx.notify();
                 })
                 .ok();
+            })
+            .detach();
+            return;
+        }
+
+        let total_items = paths.len();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = unbounded_channel::<TransferUpdate>();
+        let refresh_cwd = self.cur().cwd.clone();
+        self.transfer = Some(TransferState {
+            progress: TransferProgress {
+                completed_bytes: 0,
+                total_bytes: 0,
+                completed_items: 0,
+                total_items,
+                current: "准备复制".to_string(),
+            },
+            cancel: cancel.clone(),
+        });
+        self.set_status(format!("正在粘贴 {} 项...", count));
+        cx.notify();
+        cx.spawn(async move |weak, cx| {
+            let tx2 = tx.clone();
+            let worker_dest = refresh_cwd.clone();
+            let worker = cx.background_executor().spawn(async move {
+                let outcome = copy_paths_with_progress(&paths, &worker_dest, &cancel, &tx2);
+                let _ = tx2.send(TransferUpdate::Finished(outcome));
+            });
+            let mut rx: UnboundedReceiver<TransferUpdate> = rx;
+            while let Some(update) = rx.recv().await {
+                let finished = matches!(&update, TransferUpdate::Finished(_));
+                weak.update(cx, |this, cx| {
+                    match update {
+                        TransferUpdate::Progress {
+                            total_bytes,
+                            completed_bytes,
+                            completed_items,
+                            current,
+                        } => {
+                            if let Some(transfer) = &mut this.transfer {
+                                transfer.progress.total_bytes = total_bytes;
+                                transfer.progress.completed_bytes = completed_bytes;
+                                transfer.progress.completed_items = completed_items;
+                                transfer.progress.current = current;
+                            }
+                        }
+                        TransferUpdate::Finished(outcome) => {
+                            this.finish_transfer(outcome, &refresh_cwd, cx);
+                        }
+                    }
+                    cx.notify();
+                })
+                .ok();
+                if finished {
+                    break;
+                }
             }
+            let _ = worker.await;
         })
         .detach();
     }
 
-    fn open_menu(&mut self, target: Option<String>, position: Point<Pixels>, cx: &mut Context<Self>) {
+    fn cancel_transfer(&mut self, cx: &mut Context<Self>) {
+        if let Some(transfer) = &self.transfer {
+            transfer.cancel.store(true, AtomicOrdering::Relaxed);
+            self.set_status("正在取消粘贴...");
+            cx.notify();
+        }
+    }
+
+    fn finish_transfer(&mut self, outcome: TransferOutcome, dest: &str, cx: &mut Context<Self>) {
+        self.transfer = None;
+        match outcome {
+            TransferOutcome::Completed { success } => {
+                if success > 0 && self.cur().cwd == dest {
+                    self.send(&["cd", dest]);
+                }
+                self.set_status(format!("粘贴完成 {} 项", success));
+            }
+            TransferOutcome::Cancelled { success } => {
+                self.clipboard = None;
+                if success > 0 && self.cur().cwd == dest {
+                    self.send(&["cd", dest]);
+                }
+                self.set_status(format!("粘贴已取消，完成 {} 项", success));
+            }
+            TransferOutcome::Failed { success, message } => {
+                if success > 0 && self.cur().cwd == dest {
+                    self.send(&["cd", dest]);
+                }
+                self.set_status(format!("粘贴失败，已完成 {} 项：{}", success, message));
+            }
+        }
+        cx.notify();
+    }
+
+    fn open_menu(
+        &mut self,
+        target: Option<String>,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.cancel_input_state();
+        self.clear_status();
         // 右键命中的文件若不在选中集里，先单选它（Windows 习惯）。
         if let Some(t) = &target {
             if !self.cur().selected.iter().any(|s| s == t) {
@@ -567,7 +1757,12 @@ impl Root {
         cx.notify();
     }
 
-    fn exec_menu_action(&mut self, action: MenuAction, window: &mut Window, cx: &mut Context<Self>) {
+    fn exec_menu_action(
+        &mut self,
+        action: MenuAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let target = self.menu.as_ref().and_then(|m| m.target.clone());
         match action {
             MenuAction::Open => {
@@ -595,29 +1790,132 @@ impl Root {
     }
 
     fn toggle_theme(&mut self, cx: &mut Context<Self>) {
-        self.theme = match self.theme.syntax_theme {
-            "InspiredGitHub" => Theme::dark(),
-            _ => Theme::light(),
+        self.cancel_input_state();
+        self.clear_status();
+        let theme = match self.settings.theme {
+            ThemeMode::Dark => ThemeMode::Light,
+            ThemeMode::Light => ThemeMode::Dark,
         };
+        self.set_theme_mode(theme, cx);
+    }
+
+    fn toggle_shortcuts(&mut self, cx: &mut Context<Self>) {
+        self.shortcuts_expanded = !self.shortcuts_expanded;
+        cx.notify();
+    }
+
+    fn cycle_language(&mut self, cx: &mut Context<Self>) {
+        self.clear_status();
+        self.settings.language = match self.settings.language {
+            Language::System => Language::Chinese,
+            Language::Chinese => Language::English,
+            Language::English => Language::System,
+        };
+        if let Some(tray) = &self.tray {
+            tray.set_language(self.settings.language);
+        }
+        self.persist_settings(cx);
+    }
+
+    fn set_autostart(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if let Err(error) = settings::set_autostart(enabled) {
+            self.set_status(format!("{}: {}", self.tr("保存失败"), error));
+            cx.notify();
+            return;
+        }
+        self.settings.autostart = enabled;
+        self.persist_settings(cx);
+    }
+
+    fn start_shortcut_edit(
+        &mut self,
+        action: ShortcutAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cancel_input_state();
+        self.pending = Some(PendingOp::EditShortcut(action));
+        self.clear_status();
+        cx.focus_self(window);
+        cx.notify();
+    }
+
+    fn record_shortcut(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let Some(PendingOp::EditShortcut(action)) = self.pending else {
+            return;
+        };
+        let keystroke = &event.keystroke;
+        match keystroke.key.as_str() {
+            "escape" => {
+                self.cancel_input(cx);
+                return;
+            }
+            "backspace" => {
+                action.set_shortcut(&mut self.settings.shortcuts, String::new());
+                self.pending = None;
+                self.persist_settings(cx);
+                self.set_status(format!("{}已清除", self.tr(action.label())));
+                cx.notify();
+                return;
+            }
+            "shift" | "control" | "ctrl" | "alt" | "platform" | "super" | "win" | "function"
+            | "fn" => {
+                self.set_status(self.tr("按下快捷键..."));
+                cx.notify();
+                return;
+            }
+            _ => {}
+        }
+
+        let Some(shortcut) = keystroke_to_shortcut(keystroke) else {
+            return;
+        };
+        if let Some(conflict) = shortcut_actions().into_iter().find(|candidate| {
+            *candidate != action
+                && normalize_shortcut(candidate.shortcut(&self.settings.shortcuts)) == shortcut
+        }) {
+            self.set_status(format!(
+                "{}：{} {}",
+                self.tr("快捷键冲突"),
+                self.tr(conflict.label()),
+                self.tr("该快捷键已被占用")
+            ));
+            cx.notify();
+            return;
+        }
+        action.set_shortcut(&mut self.settings.shortcuts, shortcut);
+        self.pending = None;
+        self.persist_settings(cx);
+        self.set_status(format!("{}已更新", self.tr(action.label())));
         cx.notify();
     }
 
     // ---- 多标签 ----
 
     fn switch_tab(&mut self, i: usize, cx: &mut Context<Self>) {
+        self.cancel_input_state();
+        self.clear_status();
         if i == self.active || i >= self.tabs.len() {
             return;
         }
+        self.tabs[self.active].refreshing = false;
         self.active = i;
         self.preview = Preview::Empty;
         self.preview_path = None;
-        let cwd = self.tabs[i].cwd.clone();
-        self.send(&["cd", cwd.as_str()]);
+        if self.tabs[i].computer_view {
+            self.start_drive_scan(cx, true);
+        } else {
+            let cwd = self.tabs[i].cwd.clone();
+            self.send(&["cd", cwd.as_str()]);
+        }
         cx.notify();
     }
 
     fn new_tab(&mut self, cx: &mut Context<Self>) {
+        self.cancel_input_state();
+        self.clear_status();
         let cwd = self.cur().cwd.clone();
+        self.cur_mut().refreshing = false;
         self.tabs.push(Tab::new(&cwd));
         self.active = self.tabs.len() - 1;
         self.preview = Preview::Empty;
@@ -627,6 +1925,8 @@ impl Root {
     }
 
     fn close_tab(&mut self, i: usize, cx: &mut Context<Self>) {
+        self.cancel_input_state();
+        self.clear_status();
         if i >= self.tabs.len() {
             return;
         }
@@ -649,155 +1949,650 @@ impl Root {
         cx.notify();
     }
 
-    // ---- 输入模式（重命名 / 新建） ----
+    // ---- 输入模式（地址栏 / 重命名 / 新建） ----
 
     fn start_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_input_state();
         if self.cur().computer_view {
+            self.set_status("此电脑视图不可重命名");
+            cx.notify();
             return;
         }
-        let tab = self.cur();
-        let Some(name) = tab.selected.first().cloned() else {
+        let Some(name) = self.cur().selected.first().cloned() else {
+            self.set_status("未选择项目");
+            cx.notify();
             return;
         };
-        let path = std::path::Path::new(&tab.cwd)
+        let path = std::path::Path::new(&self.cur().cwd)
             .join(&name)
             .to_string_lossy()
             .into_owned();
-        self.input = name;
+        let is_dir = self
+            .visible_files()
+            .iter()
+            .find(|file| file.name == name)
+            .is_some_and(|file| file.is_dir);
+        self.reset_input_editor(name.clone(), false);
+        let file_name_len = file_name_of(&name).len();
+        let file_name_start = name.len().saturating_sub(file_name_len);
+        let selection = if is_dir {
+            file_name_start..name.len()
+        } else {
+            let stem_len = std::path::Path::new(&name)
+                .file_name()
+                .and_then(|file| file.to_str())
+                .and_then(|file| std::path::Path::new(file).file_stem())
+                .and_then(|stem| stem.to_str())
+                .map(str::len)
+                .unwrap_or(file_name_len);
+            file_name_start..file_name_start + stem_len
+        };
+        self.input_selection = selection;
         self.pending = Some(PendingOp::Rename { path });
-        cx.focus_self(window);
+        self.clear_status();
+        self.focus_handle.focus(window);
         cx.notify();
     }
 
     fn start_new_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.input.clear();
+        self.cancel_input_state();
+        self.reset_input_editor(String::new(), false);
         self.pending = Some(PendingOp::NewFile);
-        cx.focus_self(window);
+        self.clear_status();
+        self.focus_handle.focus(window);
         cx.notify();
     }
 
     fn start_new_dir(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.input.clear();
+        self.cancel_input_state();
+        self.reset_input_editor(String::new(), false);
         self.pending = Some(PendingOp::NewDir);
-        cx.focus_self(window);
+        self.clear_status();
+        self.focus_handle.focus(window);
         cx.notify();
     }
 
-    fn cancel_input(&mut self, cx: &mut Context<Self>) {
-        self.pending = None;
-        self.input.clear();
+    fn start_goto(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let cwd = self.cur().cwd.clone();
+        self.cancel_input_state();
+        self.reset_input_editor(cwd, true);
+        self.pending = Some(PendingOp::GoToPath);
+        self.clear_status();
+        self.focus_handle.focus(window);
         cx.notify();
     }
 
-    fn confirm_input(&mut self, cx: &mut Context<Self>) {
-        let Some(pending) = self.pending.take() else { return };
-        let name = self.input.trim().to_string();
-        self.input.clear();
-        cx.notify();
-
-        if name.is_empty() {
+    fn start_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_input_state();
+        if self.cur().computer_view {
+            self.set_status(self.tr("搜索仅支持真实目录"));
+            cx.notify();
             return;
         }
-
         let cwd = self.cur().cwd.clone();
+        self.reset_input_editor(String::new(), false);
+        self.pending = Some(PendingOp::Search);
+        self.search_generation = self.search_generation.wrapping_add(1);
+        let generation = self.search_generation;
+        self.search = Some(SearchState {
+            cwd,
+            query: String::new(),
+            results: Vec::new(),
+            generation,
+            scanning: true,
+        });
+        self.clear_selection();
+        self.preview = Preview::Empty;
+        self.preview_path = None;
+        self.menu = None;
+        self.set_status(self.tr("搜索中..."));
+        cx.focus_self(window);
+        self.start_search_scan(cx);
+        cx.notify();
+    }
+
+    fn update_search_query(&mut self, cx: &mut Context<Self>) {
+        if self.search.is_none() {
+            return;
+        }
+        self.search_generation = self.search_generation.wrapping_add(1);
+        let generation = self.search_generation;
+        let query = self.input.clone();
+        if let Some(search) = self.search.as_mut() {
+            search.generation = generation;
+            search.query = query;
+            search.results.clear();
+            search.scanning = true;
+        }
+        self.clear_selection();
+        self.preview = Preview::Empty;
+        self.preview_path = None;
+        self.set_status(self.tr("搜索中..."));
+        self.start_search_scan(cx);
+    }
+
+    fn start_search_scan(&mut self, cx: &mut Context<Self>) {
+        let Some(search) = &self.search else {
+            return;
+        };
+        let cwd = search.cwd.clone();
+        let query = search.query.clone();
+        let generation = search.generation;
         cx.spawn(async move |weak, cx| {
-            let cwd2 = cwd.clone();
-            let name2 = name.clone();
-            let ok = cx
+            let scan_cwd = cwd.clone();
+            let result = cx
                 .background_executor()
-                .spawn(async move {
-                    let target = std::path::Path::new(&cwd2).join(&name2);
-                    match &pending {
-                        PendingOp::Rename { path } => std::fs::rename(path, &target).is_ok(),
-                        PendingOp::NewFile => std::fs::write(&target, b"").is_ok(),
-                        PendingOp::NewDir => std::fs::create_dir_all(&target).is_ok(),
-                    }
-                })
+                .spawn(async move { search_directory(Path::new(&scan_cwd), &query) })
                 .await;
-            if ok {
-                let cwd3 = cwd.clone();
-                weak.update(cx, |this, _cx| {
-                    this.send(&["cd", cwd3.as_str()]);
-                })
-                .ok();
-            }
+            weak.update(cx, |this, cx| {
+                let valid = this
+                    .search
+                    .as_ref()
+                    .is_some_and(|search| search.generation == generation && search.cwd == cwd);
+                if !valid {
+                    return;
+                }
+                match result {
+                    Ok(mut results) => {
+                        sort_files(&mut results, this.cur().sort);
+                        let names = results
+                            .iter()
+                            .map(|file| file.name.clone())
+                            .collect::<Vec<_>>();
+                        if let Some(search) = this.search.as_mut() {
+                            search.results = results;
+                            search.scanning = false;
+                        }
+                        let tab = this.cur_mut();
+                        reconcile_selection(&mut tab.selected, &mut tab.anchor, &names);
+                        this.clear_status();
+                        this.reconcile_preview();
+                    }
+                    Err(error) => {
+                        if let Some(search) = this.search.as_mut() {
+                            search.results.clear();
+                            search.scanning = false;
+                        }
+                        this.set_status(format!("{}: {}", this.tr("搜索失败"), error));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
         })
         .detach();
     }
 
+    fn cancel_input(&mut self, cx: &mut Context<Self>) {
+        self.cancel_input_state();
+        cx.notify();
+    }
+
+    fn confirm_input(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.pending.as_ref(), Some(PendingOp::GoToPath)) {
+            self.confirm_goto(cx);
+            return;
+        }
+        let Some(pending) = self.pending.clone() else {
+            return;
+        };
+        if matches!(pending, PendingOp::Search | PendingOp::EditShortcut(_)) {
+            return;
+        }
+        let name = self.input.trim().to_string();
+        if name.is_empty() {
+            self.set_status("名称不能为空");
+            cx.notify();
+            return;
+        }
+
+        let operation = match &pending {
+            PendingOp::Rename { .. } => "重命名",
+            PendingOp::NewFile => "新建文件",
+            PendingOp::NewDir => "新建文件夹",
+            PendingOp::GoToPath | PendingOp::Search | PendingOp::EditShortcut(_) => return,
+        }
+        .to_string();
+        let cwd = self.cur().cwd.clone();
+        let name_for_status = name.clone();
+        self.set_status(format!("正在{} {}...", operation, name_for_status));
+        cx.notify();
+        cx.spawn(async move |weak, cx| {
+            let cwd2 = cwd.clone();
+            let name2 = name.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let target = match &pending {
+                        PendingOp::Rename { path } => Path::new(path)
+                            .parent()
+                            .unwrap_or_else(|| Path::new(&cwd2))
+                            .join(&name2),
+                        PendingOp::NewFile | PendingOp::NewDir => Path::new(&cwd2).join(&name2),
+                        PendingOp::GoToPath | PendingOp::Search | PendingOp::EditShortcut(_) => {
+                            return Err("无效的输入操作".to_string());
+                        }
+                    };
+                    match &pending {
+                        PendingOp::Rename { path } => {
+                            std::fs::rename(path, &target).map_err(|error| error.to_string())
+                        }
+                        PendingOp::NewFile => std::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&target)
+                            .map(|_| ())
+                            .map_err(|error| error.to_string()),
+                        PendingOp::NewDir => {
+                            std::fs::create_dir(&target).map_err(|error| error.to_string())
+                        }
+                        PendingOp::GoToPath | PendingOp::Search | PendingOp::EditShortcut(_) => {
+                            unreachable!()
+                        }
+                    }
+                })
+                .await;
+            let succeeded = result.is_ok();
+            weak.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => {
+                        this.cancel_input_state();
+                        this.set_status(format!("{}完成", operation));
+                    }
+                    Err(error) => {
+                        this.set_status(format!("{}失败: {}", operation, error));
+                    }
+                }
+                if succeeded {
+                    this.send(&["cd", cwd.as_str()]);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn confirm_goto(&mut self, cx: &mut Context<Self>) {
+        let cwd = self.cur().cwd.clone();
+        let target = match resolve_address_path(&cwd, &self.input) {
+            Ok(target) if std::path::Path::new(&target).is_dir() => target,
+            Ok(_) => {
+                self.set_status("目标不是有效目录");
+                cx.notify();
+                return;
+            }
+            Err(message) => {
+                self.set_status(message);
+                cx.notify();
+                return;
+            }
+        };
+
+        match self.send_checked(&["cd", target.as_str()]) {
+            Ok(()) => {
+                self.cur_mut().selected.clear();
+                self.cur_mut().anchor = None;
+                self.cur_mut().computer_view = false;
+                self.cur_mut().refreshing = false;
+                self.preview = Preview::Empty;
+                self.preview_path = None;
+                self.cancel_input_state();
+                self.set_status(format!("已跳转: {}", target));
+            }
+            Err(error) => self.set_status(format!("跳转失败: {}", error)),
+        }
+        cx.notify();
+    }
+
     fn on_input_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.pending.is_some() {
-            self.handle_typing(event, cx);
+        if matches!(self.pending, Some(PendingOp::EditShortcut(_))) {
+            self.record_shortcut(event, cx);
+        } else if matches!(self.pending, Some(PendingOp::Search)) {
+            if event.keystroke.key.as_str() == "escape" {
+                self.cancel_input(cx);
+            }
+        } else if self.pending.is_some() {
+            match event.keystroke.key.as_str() {
+                "enter" => self.confirm_input(cx),
+                "escape" => self.cancel_input(cx),
+                _ => {}
+            }
         } else {
             self.handle_shortcut(event, window, cx);
         }
     }
 
-    fn handle_shortcut(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn handle_shortcut(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let ks = &event.keystroke;
         let ctrl = ks.modifiers.control;
-        match ks.key.as_str() {
-            "t" if ctrl => self.new_tab(cx),
-            "w" if ctrl => self.close_tab(self.active, cx),
-            "a" if ctrl => {
-                let names: Vec<String> = self.cur().files.iter().map(|f| f.name.clone()).collect();
-                self.cur_mut().selected = names;
-                self.preview = Preview::Empty;
-                self.preview_path = None;
-                cx.notify();
+        if self.pending_delete.is_some() {
+            if ks.key.as_str() == "escape" {
+                self.cancel_delete_confirmation(cx);
             }
-            "delete" => self.delete_selected(cx),
-            "f2" => self.start_rename(window, cx),
-            "backspace" => self.go_parent(),
-            "escape" => {
-                if self.menu.is_some() {
-                    self.close_menu(cx);
-                } else if !self.cur().selected.is_empty() {
-                    self.click_blank(cx);
-                }
+            return;
+        }
+        if shortcut_matches(&self.settings.shortcuts.new_tab, ks) {
+            self.new_tab(cx);
+        } else if shortcut_matches(&self.settings.shortcuts.close_tab, ks) {
+            self.close_tab(self.active, cx);
+        } else if shortcut_matches(&self.settings.shortcuts.open, ks) {
+            self.open_selected(cx);
+        } else if shortcut_matches(&self.settings.shortcuts.search, ks) {
+            self.start_search(window, cx);
+        } else if shortcut_matches(&self.settings.shortcuts.copy, ks) {
+            self.copy_selected(cx);
+        } else if shortcut_matches(&self.settings.shortcuts.cut, ks) {
+            self.cut_selected(cx);
+        } else if shortcut_matches(&self.settings.shortcuts.paste, ks) {
+            self.paste_clipboard(cx);
+        } else if shortcut_matches(&self.settings.shortcuts.delete, ks) {
+            self.delete_selected(cx);
+        } else if shortcut_matches(&self.settings.shortcuts.rename, ks) {
+            self.start_rename(window, cx);
+        } else if shortcut_matches(&self.settings.shortcuts.new_file, ks) {
+            self.start_new_file(window, cx);
+        } else if shortcut_matches(&self.settings.shortcuts.new_dir, ks) {
+            self.start_new_dir(window, cx);
+        } else if ks.key.as_str() == "a" && ctrl {
+            let names: Vec<String> = self.cur().files.iter().map(|f| f.name.clone()).collect();
+            self.cur_mut().selected = names;
+            self.preview = Preview::Empty;
+            self.preview_path = None;
+            cx.notify();
+        } else if ks.key.as_str() == "backspace" {
+            self.go_parent(cx);
+        } else if ks.key.as_str() == "escape" {
+            if self.menu.is_some() {
+                self.close_menu(cx);
+            } else if !self.cur().selected.is_empty() {
+                self.click_blank(cx);
             }
-            _ => {}
         }
     }
 
-    fn handle_typing(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
-        let ks = &event.keystroke;
-        match ks.key.as_str() {
-            "enter" => self.confirm_input(cx),
-            "escape" => self.cancel_input(cx),
-            "backspace" => {
-                self.input.pop();
-                cx.notify();
-            }
-            "space" => {
-                self.input.push(' ');
-                cx.notify();
-            }
-            key if key.len() == 1 => {
-                if !ks.modifiers.control && !ks.modifiers.alt && !ks.modifiers.platform {
-                    let ch = ks.key_char.clone().unwrap_or_else(|| key.to_string());
-                    self.input.push_str(&ch);
-                    cx.notify();
-                }
-            }
-            _ => {}
-        }
+    fn input_field(
+        &self,
+        cx: &mut Context<Self>,
+        placeholder: impl Into<SharedString>,
+    ) -> AnyElement {
+        div()
+            .flex()
+            .flex_1()
+            .key_context("YaziInput")
+            .track_focus(&self.focus_handle)
+            .cursor(CursorStyle::IBeam)
+            .on_action(cx.listener(Self::input_backspace))
+            .on_action(cx.listener(Self::input_delete))
+            .on_action(cx.listener(Self::input_left))
+            .on_action(cx.listener(Self::input_right))
+            .on_action(cx.listener(Self::input_select_left))
+            .on_action(cx.listener(Self::input_select_right))
+            .on_action(cx.listener(Self::input_select_all))
+            .on_action(cx.listener(Self::input_home))
+            .on_action(cx.listener(Self::input_end))
+            .on_action(cx.listener(Self::input_paste))
+            .on_action(cx.listener(Self::input_copy))
+            .on_action(cx.listener(Self::input_cut))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::input_mouse_down))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::input_mouse_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::input_mouse_up))
+            .on_mouse_move(cx.listener(Self::input_mouse_move))
+            .id("input-field")
+            .on_click(cx.listener(|_this, _event, _window, cx| {
+                cx.stop_propagation();
+            }))
+            .child(InputElement {
+                root: cx.entity(),
+                placeholder: placeholder.into(),
+            })
+            .into_any_element()
     }
 
-    fn input_bar(&self) -> impl IntoElement {
-        let (label, text) = match &self.pending {
-            Some(PendingOp::Rename { .. }) => ("重命名", self.input.clone()),
-            Some(PendingOp::NewFile) => ("新建文件", self.input.clone()),
-            Some(PendingOp::NewDir) => ("新建文件夹", self.input.clone()),
-            None => return div(),
-        };
+    fn input_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let _ = cx;
+        div().into_any_element()
+    }
+
+    fn shortcut_setting_row(&self, cx: &mut Context<Root>, action: ShortcutAction) -> AnyElement {
+        let theme = self.theme;
+        let label = SharedString::from(self.tr(action.label()));
+        let value = action.shortcut(&self.settings.shortcuts);
+        let recording = matches!(
+            self.pending,
+            Some(PendingOp::EditShortcut(editing)) if editing == action
+        );
         div()
             .w_full()
-            .px_3()
             .py_1()
-            .bg(self.theme.surface1)
-            .text_sm()
-            .child(SharedString::from(format!("{}: {}_", label, text)))
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(div().flex_1().text_sm().child(label))
+            .child(
+                div()
+                    .min_w(px(150.0))
+                    .px_2()
+                    .py_1()
+                    .bg(theme.surface0)
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .id(action.id())
+                    .on_click(cx.listener(move |this, _event, window, cx| {
+                        this.start_shortcut_edit(action, window, cx);
+                    }))
+                    .child(shortcut_binding_view(
+                        theme,
+                        value,
+                        recording,
+                        self.language(),
+                    )),
+            )
+            .into_any_element()
+    }
+
+    fn settings_page(&self, cx: &mut Context<Root>) -> AnyElement {
+        let theme = self.theme;
+        let language = self.language();
+        let focus_handle = self.focus_handle.clone();
+        let theme_label = match self.settings.theme {
+            ThemeMode::Dark => self.tr("暗色"),
+            ThemeMode::Light => self.tr("浅色"),
+        };
+        let autostart_label = if self.settings.autostart {
+            self.tr("已开启")
+        } else {
+            self.tr("已关闭")
+        };
+        let shortcuts = if self.shortcuts_expanded {
+            [
+                ShortcutAction::Open,
+                ShortcutAction::Search,
+                ShortcutAction::NewTab,
+                ShortcutAction::CloseTab,
+                ShortcutAction::Delete,
+                ShortcutAction::Rename,
+                ShortcutAction::Copy,
+                ShortcutAction::Cut,
+                ShortcutAction::Paste,
+                ShortcutAction::NewFile,
+                ShortcutAction::NewDir,
+            ]
+            .into_iter()
+            .map(|action| self.shortcut_setting_row(cx, action))
+            .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let shortcut_indicator = if self.shortcuts_expanded {
+            "▾"
+        } else {
+            "▸"
+        };
+        let shortcuts_label =
+            SharedString::from(format!("{} {}", shortcut_indicator, self.tr("快捷键")));
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(theme.base)
+            .text_color(theme.text)
+            .id("root")
+            .track_focus(&focus_handle)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                this.on_input_key(event, window, cx);
+            }))
+            .child(
+                div()
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .bg(theme.crust)
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(action_button(
+                        cx,
+                        theme,
+                        "settings-back",
+                        self.tr("返回文件"),
+                        |this, _window, cx| this.show_files(cx),
+                    ))
+                    .child(div().text_lg().child(self.tr("设置"))),
+            )
+            .child(self.input_bar(cx))
+            .child(
+                div()
+                    .flex_1()
+                    .id("settings-content")
+                    .overflow_y_scroll()
+                    .px_5()
+                    .py_4()
+                    .child(
+                        div()
+                            .w_full()
+                            .max_w(px(720.0))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(div().py_2().text_lg().child(self.tr("外观")))
+                            .child(settings_line(
+                                cx,
+                                theme,
+                                self.tr("主题"),
+                                theme_label,
+                                "settings-theme",
+                                |this, _window, cx| this.toggle_theme(cx),
+                            ))
+                            .child(settings_line(
+                                cx,
+                                theme,
+                                self.tr("语言"),
+                                self.tr(language.label()),
+                                "settings-language",
+                                |this, _window, cx| this.cycle_language(cx),
+                            ))
+                            .child(div().py_2().text_lg().child(self.tr("行为")))
+                            .child(settings_line(
+                                cx,
+                                theme,
+                                self.tr("自启动"),
+                                autostart_label,
+                                "settings-autostart",
+                                |this, _window, cx| {
+                                    this.set_autostart(!this.settings.autostart, cx)
+                                },
+                            ))
+                            .child(
+                                div()
+                                    .py_1()
+                                    .text_xs()
+                                    .text_color(theme.muted)
+                                    .child(self.tr("自启动默认关闭")),
+                            )
+                            .child(
+                                div()
+                                    .py_2()
+                                    .text_lg()
+                                    .cursor_pointer()
+                                    .id("settings-shortcuts-toggle")
+                                    .on_click(cx.listener(|this, _event, _window, cx| {
+                                        this.toggle_shortcuts(cx);
+                                    }))
+                                    .child(shortcuts_label),
+                            )
+                            .children(shortcuts)
+                            .child(div().py_2().text_lg().child(self.tr("关于")))
+                            .child(div().py_1().text_sm().child(format!(
+                                "{}: {}",
+                                self.tr("当前版本"),
+                                env!("CARGO_PKG_VERSION")
+                            )))
+                            .child(
+                                div()
+                                    .py_1()
+                                    .text_xs()
+                                    .text_color(theme.muted)
+                                    .child(self.tr("关闭窗口时隐藏到托盘")),
+                            )
+                            .child(action_button(
+                                cx,
+                                theme,
+                                "settings-update",
+                                self.tr("检查更新"),
+                                |this, _window, cx| {
+                                    this.set_status(this.tr("未配置更新源"));
+                                    cx.notify();
+                                },
+                            )),
+                    ),
+            )
+            .child(self.status_bar(
+                cx,
+                theme,
+                SharedString::from(self.status.clone().unwrap_or_default()),
+            ))
+            .into_any_element()
+    }
+
+    fn address_bar(&self, cx: &mut Context<Self>, cwd: SharedString) -> AnyElement {
+        if matches!(
+            self.pending.as_ref(),
+            Some(PendingOp::GoToPath | PendingOp::Search)
+        ) {
+            div()
+                .flex_1()
+                .px_2()
+                .py_1()
+                .bg(self.theme.surface0)
+                .rounded_sm()
+                .child(self.input_field(
+                    cx,
+                    if matches!(self.pending, Some(PendingOp::Search)) {
+                        self.tr("输入搜索...")
+                    } else {
+                        self.tr("输入路径...")
+                    },
+                ))
+                .into_any_element()
+        } else {
+            div()
+                .flex_1()
+                .text_sm()
+                .id("addr-bar")
+                .cursor_pointer()
+                .child(cwd)
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    this.start_goto(window, cx);
+                }))
+                .into_any_element()
+        }
     }
 
     fn tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -810,24 +2605,25 @@ impl Root {
             .flex()
             .items_center()
             .gap_1()
-            .children(
-                self.tabs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, tab)| {
-                        let active = i == self.active;
-                        let name = SharedString::from(tab_name(&tab.cwd));
-                        tab_button(cx, theme, i, name, active)
-                    }),
-            )
+            .children(self.tabs.iter().enumerate().map(|(i, tab)| {
+                let active = i == self.active;
+                let name = SharedString::from(if tab.computer_view {
+                    self.tr("此电脑")
+                } else {
+                    tab_name(&tab.cwd)
+                });
+                tab_button(cx, theme, i, name, active)
+            }))
             .child(new_tab_button(cx, theme))
     }
 
     fn context_menu(&self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(menu) = &self.menu else { return div().into_any_element() };
+        let Some(menu) = &self.menu else {
+            return div().into_any_element();
+        };
         let theme = self.theme;
         let pos = menu.position;
-        let items = menu_items_for(&menu.target, self.cur().computer_view);
+        let items = menu_items_for(&menu.target, self.cur().computer_view, self.language());
 
         div()
             .absolute()
@@ -849,9 +2645,11 @@ impl Root {
                     .border_1()
                     .border_color(theme.surface0)
                     .rounded_md()
-                    .children(items.iter().map(|(label, action)| {
-                        menu_item(cx, theme, label, *action)
-                    })),
+                    .children(
+                        items
+                            .iter()
+                            .map(|(label, action)| menu_item(cx, theme, label.clone(), *action)),
+                    ),
             )
             .into_any_element()
     }
@@ -863,19 +2661,315 @@ impl Focusable for Root {
     }
 }
 
+impl EntityInputHandler for Root {
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let range = self.input_range_from_utf16(&range_utf16);
+        adjusted_range.replace(self.input_range_to_utf16(&range));
+        Some(self.input[range].to_string())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        Some(UTF16Selection {
+            range: self.input_range_to_utf16(&self.input_selection),
+            reversed: self.selection_reversed,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        self.marked_range
+            .as_ref()
+            .map(|range| self.input_range_to_utf16(range))
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.marked_range = None;
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let range = range_utf16
+            .as_ref()
+            .map(|range| self.input_range_from_utf16(range))
+            .or_else(|| self.marked_range.clone())
+            .unwrap_or_else(|| self.input_selection.clone());
+        self.replace_input_range(range, text, cx);
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range_utf16: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let range = range_utf16
+            .as_ref()
+            .map(|range| self.input_range_from_utf16(range))
+            .or_else(|| self.marked_range.clone())
+            .unwrap_or_else(|| self.input_selection.clone());
+        self.input.replace_range(range.clone(), new_text);
+        self.marked_range = if new_text.is_empty() {
+            None
+        } else {
+            Some(range.start..range.start + new_text.len())
+        };
+        self.input_selection = new_selected_range_utf16
+            .as_ref()
+            .map(|range| self.input_range_from_utf16(range))
+            .map(|selected| range.start + selected.start..range.start + selected.end)
+            .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
+        self.selection_reversed = false;
+        if matches!(self.pending, Some(PendingOp::Search)) {
+            self.update_search_query(cx);
+        }
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let line = self.input_layout.as_ref()?;
+        let range = self.input_range_from_utf16(&range_utf16);
+        Some(Bounds::from_corners(
+            point(bounds.left() + line.x_for_index(range.start), bounds.top()),
+            point(bounds.left() + line.x_for_index(range.end), bounds.bottom()),
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let bounds = self.input_bounds.as_ref()?;
+        let line = self.input_layout.as_ref()?;
+        let local = bounds.localize(&point)?;
+        let index = line.index_for_x(local.x)?.min(self.input.len());
+        Some(self.input_offset_to_utf16(index))
+    }
+}
+
+struct InputElement {
+    root: Entity<Root>,
+    placeholder: SharedString,
+}
+
+struct InputPrepaintState {
+    line: Option<ShapedLine>,
+    cursor: Option<PaintQuad>,
+    selection: Option<PaintQuad>,
+}
+
+impl IntoElement for InputElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for InputElement {
+    type RequestLayoutState = ();
+    type PrepaintState = InputPrepaintState;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut style = Style::default();
+        style.size.width = relative(1.).into();
+        style.size.height = window.line_height().into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        let input = self.root.read(cx);
+        let content = input.input.clone();
+        let selected_range = input.input_selection.clone();
+        let cursor = input.input_cursor_offset();
+        let style = window.text_style();
+        let (display_text, text_color) = if content.is_empty() {
+            (self.placeholder.clone(), hsla(0., 0., 0., 0.45))
+        } else {
+            (content.clone().into(), style.color)
+        };
+
+        let run = TextRun {
+            len: display_text.len(),
+            font: style.font(),
+            color: text_color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let runs = if let Some(marked_range) = input.marked_range.as_ref() {
+            vec![
+                TextRun {
+                    len: marked_range.start,
+                    ..run.clone()
+                },
+                TextRun {
+                    len: marked_range.end - marked_range.start,
+                    underline: Some(UnderlineStyle {
+                        color: Some(run.color),
+                        thickness: px(1.0),
+                        wavy: false,
+                    }),
+                    ..run.clone()
+                },
+                TextRun {
+                    len: display_text.len() - marked_range.end,
+                    ..run
+                },
+            ]
+            .into_iter()
+            .filter(|run| run.len > 0)
+            .collect()
+        } else {
+            vec![run]
+        };
+
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        let line = window
+            .text_system()
+            .shape_line(display_text, font_size, &runs, None);
+        let cursor_pos = line.x_for_index(cursor);
+        let (selection, cursor) = if selected_range.is_empty() {
+            (
+                None,
+                Some(fill(
+                    Bounds::new(
+                        point(bounds.left() + cursor_pos, bounds.top()),
+                        size(px(2.), bounds.bottom() - bounds.top()),
+                    ),
+                    gpui::blue(),
+                )),
+            )
+        } else {
+            (
+                Some(fill(
+                    Bounds::from_corners(
+                        point(
+                            bounds.left() + line.x_for_index(selected_range.start),
+                            bounds.top(),
+                        ),
+                        point(
+                            bounds.left() + line.x_for_index(selected_range.end),
+                            bounds.bottom(),
+                        ),
+                    ),
+                    rgba(0x3311ff30),
+                )),
+                None,
+            )
+        };
+
+        InputPrepaintState {
+            line: Some(line),
+            cursor,
+            selection,
+        }
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let focus_handle = self.root.read(cx).focus_handle.clone();
+        window.handle_input(
+            &focus_handle,
+            ElementInputHandler::new(bounds, self.root.clone()),
+            cx,
+        );
+        if let Some(selection) = prepaint.selection.take() {
+            window.paint_quad(selection);
+        }
+        let line = prepaint.line.take().unwrap();
+        line.paint(bounds.origin, window.line_height(), window, cx)
+            .unwrap();
+        if focus_handle.is_focused(window) {
+            if let Some(cursor) = prepaint.cursor.take() {
+                window.paint_quad(cursor);
+            }
+        }
+        self.root.update(cx, |input, _cx| {
+            input.input_layout = Some(line);
+            input.input_bounds = Some(bounds);
+        });
+    }
+}
+
 impl Render for Root {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.page == Page::Settings {
+            return self.settings_page(cx);
+        }
         let computer_view = self.cur().computer_view;
         let cwd = SharedString::from(if computer_view {
-            "此电脑".to_string()
+            self.tr("此电脑")
         } else {
             self.cur().cwd.clone()
         });
-        let status = SharedString::from(if computer_view {
-            format!("{} 个磁盘", drives().len())
-        } else {
-            format!("{} 项", self.cur().files.len())
-        });
+        let status = SharedString::from(self.status.clone().unwrap_or_else(|| {
+            if computer_view {
+                format!("{} {}", self.drive_roots.len(), self.tr("个磁盘"))
+            } else if let Some(search) = &self.search {
+                format!("{} {}", search.results.len(), self.tr("项"))
+            } else {
+                format!("{} {}", self.cur().files.len(), self.tr("项"))
+            }
+        }));
         let focus_handle = self.focus_handle.clone();
         let theme = self.theme;
 
@@ -900,8 +2994,10 @@ impl Render for Root {
                     .flex()
                     .items_center()
                     .gap_3()
-                    .child(div().flex_1().text_sm().child(cwd))
-                    .child(parent_button(cx, theme)),
+                    .child(self.address_bar(cx, cwd))
+                    .child(refresh_button(cx, theme, self.language()))
+                    .child(parent_button(cx, theme, self.language()))
+                    .child(computer_button(cx, theme, self.language())),
             )
             .child(
                 div()
@@ -911,84 +3007,399 @@ impl Render for Root {
                     .bg(theme.mantle)
                     .flex()
                     .gap_2()
-                    .child(action_button(cx, theme, "btn-open", "打开", |this, _w, cx| this.open_selected(cx)))
-                    .child(action_button(cx, theme, "btn-delete", "删除", |this, _w, cx| this.delete_selected(cx)))
-                    .child(action_button(cx, theme, "btn-rename", "重命名", |this, w, cx| this.start_rename(w, cx)))
-                    .child(action_button(cx, theme, "btn-yank", "复制", |this, _w, cx| this.copy_selected(cx)))
-                    .child(action_button(cx, theme, "btn-cut", "剪切", |this, _w, cx| this.cut_selected(cx)))
-                    .child(action_button(cx, theme, "btn-paste", "粘贴", |this, _w, cx| this.paste_clipboard(cx)))
-                    .child(action_button(cx, theme, "btn-newfile", "新建文件", |this, w, cx| this.start_new_file(w, cx)))
-                    .child(action_button(cx, theme, "btn-newdir", "新建文件夹", |this, w, cx| this.start_new_dir(w, cx)))
-                    .child(action_button(cx, theme, "btn-theme", theme.name, |this, _w, cx| this.toggle_theme(cx))),
+                    .child(action_button(
+                        cx,
+                        theme,
+                        "btn-open",
+                        self.tr("打开"),
+                        |this, _w, cx| this.open_selected(cx),
+                    ))
+                    .child(action_button(
+                        cx,
+                        theme,
+                        "btn-search",
+                        self.tr("搜索"),
+                        |this, w, cx| this.start_search(w, cx),
+                    ))
+                    .child(action_button(
+                        cx,
+                        theme,
+                        "btn-delete",
+                        self.tr("删除"),
+                        |this, _w, cx| this.delete_selected(cx),
+                    ))
+                    .child(action_button(
+                        cx,
+                        theme,
+                        "btn-rename",
+                        self.tr("重命名"),
+                        |this, w, cx| this.start_rename(w, cx),
+                    ))
+                    .child(action_button(
+                        cx,
+                        theme,
+                        "btn-yank",
+                        self.tr("复制"),
+                        |this, _w, cx| this.copy_selected(cx),
+                    ))
+                    .child(action_button(
+                        cx,
+                        theme,
+                        "btn-cut",
+                        self.tr("剪切"),
+                        |this, _w, cx| this.cut_selected(cx),
+                    ))
+                    .child(action_button(
+                        cx,
+                        theme,
+                        "btn-paste",
+                        self.tr("粘贴"),
+                        |this, _w, cx| this.paste_clipboard(cx),
+                    ))
+                    .child(action_button(
+                        cx,
+                        theme,
+                        "btn-newfile",
+                        self.tr("新建文件"),
+                        |this, w, cx| this.start_new_file(w, cx),
+                    ))
+                    .child(action_button(
+                        cx,
+                        theme,
+                        "btn-newdir",
+                        self.tr("新建文件夹"),
+                        |this, w, cx| this.start_new_dir(w, cx),
+                    ))
+                    .child(action_button(
+                        cx,
+                        theme,
+                        "btn-settings",
+                        self.tr("设置"),
+                        |this, _w, cx| this.show_settings(cx),
+                    )),
             )
-            .child(self.input_bar())
+            .child(self.input_bar(cx))
             .child(
                 div()
                     .flex()
                     .flex_1()
+                    .h_full()
                     .flex_row()
                     .child(self.file_list(cx))
                     .child(div().w(px(1.0)).bg(theme.surface0))
                     .child(self.preview_pane()),
             )
-            .child(
-                div()
-                    .w_full()
-                    .px_3()
-                    .py_1()
-                    .bg(theme.crust)
-                    .text_xs()
-                    .text_color(theme.muted)
-                    .child(status),
-            )
+            .child(self.status_bar(cx, theme, status))
             .child(self.context_menu(cx))
+            .child(self.delete_confirmation(cx))
+            .into_any_element()
     }
 }
 
 impl Root {
-    fn file_list(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn status_bar(&self, cx: &mut Context<Root>, theme: Theme, status: SharedString) -> AnyElement {
+        let Some(transfer) = &self.transfer else {
+            return div()
+                .w_full()
+                .px_3()
+                .py_1()
+                .bg(theme.crust)
+                .text_xs()
+                .text_color(theme.muted)
+                .child(status)
+                .into_any_element();
+        };
+
+        let progress = &transfer.progress;
+        let fraction = if progress.total_bytes > 0 {
+            progress.completed_bytes as f32 / progress.total_bytes as f32
+        } else if progress.total_items > 0 {
+            progress.completed_items as f32 / progress.total_items as f32
+        } else {
+            0.0
+        }
+        .clamp(0.0, 1.0);
+        let current = settings::translate(self.language(), &progress.current);
+        let summary = SharedString::from(format!(
+            "{} {:.0}% · {} / {} · {}",
+            self.tr("粘贴"),
+            fraction * 100.0,
+            human_size(progress.completed_bytes),
+            human_size(progress.total_bytes),
+            current
+        ));
+
+        div()
+            .w_full()
+            .px_3()
+            .py_1()
+            .bg(theme.crust)
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .flex_1()
+                    .h(px(4.0))
+                    .bg(theme.surface0)
+                    .rounded_sm()
+                    .child(
+                        div()
+                            .h_full()
+                            .w(relative(fraction))
+                            .bg(theme.blue)
+                            .rounded_sm(),
+                    ),
+            )
+            .child(div().text_xs().text_color(theme.muted).child(summary))
+            .child(action_button(
+                cx,
+                theme,
+                "btn-cancel-transfer",
+                "取消",
+                |this, _window, cx| this.cancel_transfer(cx),
+            ))
+            .into_any_element()
+    }
+
+    fn delete_confirmation(&self, cx: &mut Context<Root>) -> AnyElement {
+        let Some(request) = &self.pending_delete else {
+            return div().into_any_element();
+        };
+        let theme = self.theme;
+        let summary = SharedString::from(format!(
+            "{} {}，{} {} {}。{}，{}。",
+            self.tr("已选择"),
+            request.paths.len(),
+            self.tr("其中"),
+            request.network_count,
+            self.tr("项位于网络驱动器"),
+            self.tr("网络项目确认后将永久删除"),
+            self.tr("无法恢复"),
+        ));
+
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(theme.crust)
+            .id("delete-confirmation-mask")
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.cancel_delete_confirmation(cx);
+            }))
+            .child(
+                div()
+                    .w(px(460.0))
+                    .p_4()
+                    .bg(theme.mantle)
+                    .rounded_md()
+                    .id("delete-confirmation-dialog")
+                    .on_click(cx.listener(|_this, _event, _window, cx| {
+                        cx.stop_propagation();
+                    }))
+                    .child(div().text_sm().child(self.tr("确认永久删除网络项目？")))
+                    .child(
+                        div()
+                            .pt_2()
+                            .text_xs()
+                            .text_color(theme.muted)
+                            .child(summary),
+                    )
+                    .child(
+                        div()
+                            .pt_4()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(dialog_button(
+                                cx,
+                                theme,
+                                "btn-cancel-delete",
+                                self.tr("取消"),
+                                |this, _window, cx| this.cancel_delete_confirmation(cx),
+                            ))
+                            .child(dialog_button(
+                                cx,
+                                theme,
+                                "btn-confirm-delete",
+                                self.tr("确认永久删除"),
+                                |this, _window, cx| this.confirm_delete(cx),
+                            )),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn file_list(&self, cx: &Context<Root>) -> impl IntoElement {
         let theme = self.theme;
         let computer_view = self.cur().computer_view;
-        let selected: Vec<String> = self.cur().selected.clone();
+        let search_active = self.search.is_some();
 
         // computer_view 时显示磁盘盘符；否则显示当前目录文件。
-        let entries: Vec<(String, bool, u64)> = if computer_view {
-            drives().iter().map(|d| (d.clone(), true, 0u64)).collect()
+        let mut entries: Vec<(String, bool, u64, f64, bool)> = if computer_view {
+            let mut drive_entries: Vec<FileEntry> = self
+                .drive_roots
+                .iter()
+                .map(|name| FileEntry {
+                    name: name.clone(),
+                    is_dir: true,
+                    is_hidden: false,
+                    size: 0,
+                    mtime: 0.0,
+                })
+                .collect();
+            sort_files(&mut drive_entries, self.cur().sort);
+            drive_entries
+                .into_iter()
+                .map(|file| (file.name, file.is_dir, file.size, file.mtime, false))
+                .collect()
+        } else if search_active {
+            self.search
+                .as_ref()
+                .map(|search| {
+                    search
+                        .results
+                        .iter()
+                        .map(|file| (file.name.clone(), file.is_dir, file.size, file.mtime, false))
+                        .collect()
+                })
+                .unwrap_or_default()
         } else {
             self.cur()
                 .files
                 .iter()
-                .map(|f| (f.name.clone(), f.is_dir, f.size))
+                .map(|f| (f.name.clone(), f.is_dir, f.size, f.mtime, false))
                 .collect()
         };
+        let new_item = matches!(self.pending, Some(PendingOp::NewFile | PendingOp::NewDir));
+        if new_item {
+            entries.push((String::new(), false, 0, 0.0, true));
+        }
 
         div()
             .flex_1()
+            .h_full()
+            .flex()
+            .flex_col()
             .id("file-list")
-            .overflow_y_scroll()
             .on_click(cx.listener(|this, _event, _window, cx| {
                 this.click_blank(cx);
             }))
-            .on_mouse_down(MouseButton::Right, cx.listener(|this, event: &MouseDownEvent, _window, cx| {
-                this.open_menu(None, event.position, cx);
-                cx.stop_propagation();
-            }))
-            .children(entries.iter().map(|(name, is_dir, size)| {
-                let selected = selected.iter().any(|s| s == name);
-                file_row(cx, theme, name.clone(), *is_dir, *size, selected)
-            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                    this.open_menu(None, event.position, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .child(self.file_header(cx, theme))
+            .child(
+                div().flex_1().h_full().child(
+                    uniform_list(
+                        "file-list-items",
+                        entries.len(),
+                        cx.processor(move |this, range: Range<usize>, _window, list_cx| {
+                            range
+                                .filter_map(|ix| {
+                                    let (name, is_dir, size, mtime, new_item) =
+                                        entries.get(ix)?.clone();
+                                    let selected =
+                                        this.cur().selected.iter().any(|item| item == &name);
+                                    let inline_rename = matches!(
+                                        this.pending.as_ref(),
+                                        Some(PendingOp::Rename { path })
+                                            if Path::new(path)
+                                                == &Path::new(&this.cur().cwd).join(&name)
+                                    );
+                                    let inline = new_item || inline_rename;
+                                    let inline_input = inline.then(|| {
+                                        let placeholder = if new_item
+                                            && matches!(this.pending, Some(PendingOp::NewDir))
+                                        {
+                                            this.tr("输入名称...")
+                                        } else {
+                                            this.tr("输入名称...")
+                                        };
+                                        this.input_field(list_cx, placeholder)
+                                    });
+                                    Some(
+                                        file_row(
+                                            list_cx,
+                                            theme,
+                                            name,
+                                            is_dir,
+                                            size,
+                                            mtime,
+                                            selected,
+                                            inline,
+                                            inline_input,
+                                        )
+                                        .into_any_element(),
+                                    )
+                                })
+                                .collect()
+                        }),
+                    )
+                    .h_full(),
+                ),
+            )
+    }
+
+    fn file_header(&self, cx: &Context<Root>, theme: Theme) -> AnyElement {
+        let sort = self.cur().sort;
+        div()
+            .w_full()
+            .px_3()
+            .py_1()
+            .bg(theme.mantle)
+            .flex()
+            .items_center()
+            .gap_3()
+            .child(sort_header(
+                cx,
+                theme,
+                self.tr("名称"),
+                SortField::Name,
+                sort,
+                true,
+                0.0,
+            ))
+            .child(sort_header(
+                cx,
+                theme,
+                self.tr("修改时间"),
+                SortField::Modified,
+                sort,
+                false,
+                135.0,
+            ))
+            .child(sort_header(
+                cx,
+                theme,
+                self.tr("大小"),
+                SortField::Size,
+                sort,
+                false,
+                80.0,
+            ))
+            .into_any_element()
     }
 
     fn preview_pane(&self) -> impl IntoElement {
         let tab = self.cur();
         let title = SharedString::from(match tab.selected.len() {
-            0 => "预览".to_string(),
+            0 => self.tr("预览"),
             1 => tab.selected[0].clone(),
-            n => format!("已选 {} 项", n),
+            n => format!("{} {} {}", self.tr("已选"), n, self.tr("项")),
         });
 
         div()
             .flex_1()
+            .h_full()
             .flex()
             .flex_col()
             .bg(self.theme.mantle)
@@ -1004,6 +3415,7 @@ impl Root {
             .child(
                 div()
                     .flex_1()
+                    .h_full()
                     .id("preview-content")
                     .overflow_y_scroll()
                     .px_3()
@@ -1017,18 +3429,19 @@ impl Root {
             Preview::Empty => div()
                 .text_sm()
                 .text_color(self.theme.muted)
-                .child("单击选中文件以预览")
+                .child(self.tr("单击选中文件以预览"))
                 .into_any_element(),
             Preview::Loading => div()
                 .text_sm()
                 .text_color(self.theme.muted)
-                .child("加载中...")
+                .child(self.tr("加载中..."))
                 .into_any_element(),
-            Preview::Dir => div().text_sm().child("目录").into_any_element(),
+            Preview::Dir => div().text_sm().child(self.tr("目录")).into_any_element(),
             Preview::Binary { size } => div()
                 .text_sm()
                 .child(SharedString::from(format!(
-                    "二进制文件 · {}",
+                    "{} · {}",
+                    self.tr("二进制文件"),
                     human_size(*size)
                 )))
                 .into_any_element(),
@@ -1039,9 +3452,7 @@ impl Root {
                 .into_any_element(),
             Preview::Code { text, highlights } => div()
                 .text_xs()
-                .child(
-                    StyledText::new(text.clone()).with_highlights(highlights.clone()),
-                )
+                .child(StyledText::new(text.clone()).with_highlights(highlights.clone()))
                 .into_any_element(),
             Preview::Text(t) => div()
                 .text_xs()
@@ -1080,10 +3491,13 @@ fn tab_button(
         .on_click(cx.listener(move |this, _e, _w, cx| {
             this.switch_tab(i, cx);
         }))
-        .on_mouse_down(MouseButton::Middle, cx.listener(move |this, _e, _w, cx| {
-            this.close_tab(i, cx);
-            cx.stop_propagation();
-        }))
+        .on_mouse_down(
+            MouseButton::Middle,
+            cx.listener(move |this, _e, _w, cx| {
+                this.close_tab(i, cx);
+                cx.stop_propagation();
+            }),
+        )
         .child(div().text_sm().child(name))
         .child(
             div()
@@ -1114,7 +3528,7 @@ fn new_tab_button(cx: &mut Context<Root>, theme: Theme) -> impl IntoElement {
         }))
 }
 
-fn parent_button(cx: &mut Context<Root>, theme: Theme) -> impl IntoElement {
+fn refresh_button(cx: &mut Context<Root>, theme: Theme, language: Language) -> impl IntoElement {
     div()
         .px_2()
         .py_1()
@@ -1122,10 +3536,40 @@ fn parent_button(cx: &mut Context<Root>, theme: Theme) -> impl IntoElement {
         .rounded_md()
         .cursor_pointer()
         .text_sm()
-        .child("上级 ..")
+        .child(settings::translate(language, "刷新"))
+        .id("btn-refresh")
+        .on_click(cx.listener(|this, _event, _window, cx| {
+            this.refresh_current(cx);
+        }))
+}
+
+fn parent_button(cx: &mut Context<Root>, theme: Theme, language: Language) -> impl IntoElement {
+    div()
+        .px_2()
+        .py_1()
+        .bg(theme.surface0)
+        .rounded_md()
+        .cursor_pointer()
+        .text_sm()
+        .child(settings::translate(language, "上级 .."))
         .id("btn-parent")
         .on_click(cx.listener(|this, _event, _window, _cx| {
-            this.go_parent();
+            this.go_parent(_cx);
+        }))
+}
+
+fn computer_button(cx: &mut Context<Root>, theme: Theme, language: Language) -> impl IntoElement {
+    div()
+        .px_2()
+        .py_1()
+        .bg(theme.surface0)
+        .rounded_md()
+        .cursor_pointer()
+        .text_sm()
+        .child(settings::translate(language, "此电脑"))
+        .id("btn-computer")
+        .on_click(cx.listener(|this, _event, _window, cx| {
+            this.show_computer_view(cx);
         }))
 }
 
@@ -1133,7 +3577,7 @@ fn action_button(
     cx: &mut Context<Root>,
     theme: Theme,
     id: &'static str,
-    label: &'static str,
+    label: impl Into<SharedString>,
     on_click: impl Fn(&mut Root, &mut Window, &mut Context<Root>) + 'static,
 ) -> impl IntoElement {
     div()
@@ -1143,33 +3587,127 @@ fn action_button(
         .rounded_md()
         .cursor_pointer()
         .text_sm()
-        .child(label)
+        .child(label.into())
         .id(id)
         .on_click(cx.listener(move |this, _event, window, cx| {
             on_click(this, window, cx);
         }))
 }
 
+fn shortcut_binding_view(
+    theme: Theme,
+    value: &str,
+    recording: bool,
+    language: Language,
+) -> AnyElement {
+    if recording {
+        return div()
+            .text_xs()
+            .text_color(theme.blue)
+            .child(settings::translate(language, "按下快捷键..."))
+            .into_any_element();
+    }
+    let value = normalize_shortcut(value);
+    if value.is_empty() {
+        return div()
+            .text_sm()
+            .text_color(theme.muted)
+            .child("—")
+            .into_any_element();
+    }
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .children(value.split('+').map(|part| {
+            div()
+                .px_1()
+                .py(px(1.0))
+                .bg(theme.mantle)
+                .rounded_sm()
+                .text_xs()
+                .child(part.to_ascii_uppercase())
+        }))
+        .into_any_element()
+}
+
+fn dialog_button(
+    cx: &mut Context<Root>,
+    theme: Theme,
+    id: &'static str,
+    label: impl Into<SharedString>,
+    on_click: impl Fn(&mut Root, &mut Window, &mut Context<Root>) + 'static,
+) -> impl IntoElement {
+    div()
+        .px_2()
+        .py_1()
+        .bg(theme.surface0)
+        .rounded_md()
+        .cursor_pointer()
+        .text_sm()
+        .child(label.into())
+        .id(id)
+        .on_click(cx.listener(move |this, _event, window, cx| {
+            on_click(this, window, cx);
+            cx.stop_propagation();
+        }))
+}
+
+fn settings_line(
+    cx: &mut Context<Root>,
+    theme: Theme,
+    label: String,
+    value: String,
+    id: &'static str,
+    on_click: impl Fn(&mut Root, &mut Window, &mut Context<Root>) + 'static,
+) -> AnyElement {
+    div()
+        .w_full()
+        .py_1()
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(div().flex_1().text_sm().child(label))
+        .child(action_button(cx, theme, id, value, on_click))
+        .into_any_element()
+}
+
 /// 根据右键目标生成菜单项。
-fn menu_items_for(target: &Option<String>, computer_view: bool) -> Vec<(&'static str, MenuAction)> {
+fn menu_items_for(
+    target: &Option<String>,
+    computer_view: bool,
+    language: Language,
+) -> Vec<(String, MenuAction)> {
     if computer_view {
-        return vec![("打开", MenuAction::Open)];
+        return vec![(settings::translate(language, "打开"), MenuAction::Open)];
     }
     match target {
         Some(_) => vec![
-            ("打开", MenuAction::Open),
-            ("重命名", MenuAction::Rename),
-            ("删除", MenuAction::Delete),
-            ("复制", MenuAction::Copy),
-            ("剪切", MenuAction::Cut),
-            ("粘贴", MenuAction::Paste),
-            ("新建文件", MenuAction::NewFile),
-            ("新建文件夹", MenuAction::NewDir),
+            (settings::translate(language, "打开"), MenuAction::Open),
+            (settings::translate(language, "重命名"), MenuAction::Rename),
+            (settings::translate(language, "删除"), MenuAction::Delete),
+            (settings::translate(language, "复制"), MenuAction::Copy),
+            (settings::translate(language, "剪切"), MenuAction::Cut),
+            (settings::translate(language, "粘贴"), MenuAction::Paste),
+            (
+                settings::translate(language, "新建文件"),
+                MenuAction::NewFile,
+            ),
+            (
+                settings::translate(language, "新建文件夹"),
+                MenuAction::NewDir,
+            ),
         ],
         None => vec![
-            ("粘贴", MenuAction::Paste),
-            ("新建文件", MenuAction::NewFile),
-            ("新建文件夹", MenuAction::NewDir),
+            (settings::translate(language, "粘贴"), MenuAction::Paste),
+            (
+                settings::translate(language, "新建文件"),
+                MenuAction::NewFile,
+            ),
+            (
+                settings::translate(language, "新建文件夹"),
+                MenuAction::NewDir,
+            ),
         ],
     }
 }
@@ -1177,9 +3715,10 @@ fn menu_items_for(target: &Option<String>, computer_view: bool) -> Vec<(&'static
 fn menu_item(
     cx: &mut Context<Root>,
     theme: Theme,
-    label: &'static str,
+    label: String,
     action: MenuAction,
 ) -> AnyElement {
+    let id = SharedString::from(label.clone());
     div()
         .px_3()
         .py_1()
@@ -1187,7 +3726,7 @@ fn menu_item(
         .hover(|s| s.bg(theme.surface0))
         .text_sm()
         .child(label)
-        .id(label)
+        .id(id)
         .on_click(cx.listener(move |this, _event, window, cx| {
             this.exec_menu_action(action, window, cx);
             cx.stop_propagation();
@@ -1195,13 +3734,53 @@ fn menu_item(
         .into_any_element()
 }
 
-fn file_row(
+fn sort_header(
     cx: &Context<Root>,
+    theme: Theme,
+    label: impl Into<SharedString>,
+    field: SortField,
+    sort: SortState,
+    flexible: bool,
+    width: f32,
+) -> AnyElement {
+    let label: SharedString = label.into();
+    let active = sort.field == field;
+    let arrow = if active {
+        match sort.direction {
+            SortDirection::Ascending => " ↑",
+            SortDirection::Descending => " ↓",
+        }
+    } else {
+        ""
+    };
+    let mut element = div()
+        .cursor_pointer()
+        .text_xs()
+        .text_color(if active { theme.text } else { theme.muted })
+        .id(SharedString::from(format!("sort-{:?}", field)))
+        .on_click(cx.listener(move |this, _event, _window, cx| {
+            this.toggle_sort(field, cx);
+            cx.stop_propagation();
+        }))
+        .child(SharedString::from(format!("{}{}", label, arrow)));
+    if flexible {
+        element = element.flex_1();
+    } else {
+        element = element.w(px(width));
+    }
+    element.into_any_element()
+}
+
+fn file_row(
+    cx: &mut Context<Root>,
     theme: Theme,
     name: String,
     is_dir: bool,
     size: u64,
+    mtime: f64,
     selected: bool,
+    inline: bool,
+    inline_input: Option<AnyElement>,
 ) -> impl IntoElement {
     let icon = file_icon(&name, is_dir);
     let display = SharedString::from(if is_dir {
@@ -1209,6 +3788,7 @@ fn file_row(
     } else {
         format!("{} {}", icon, name)
     });
+    let modified = SharedString::from(format_mtime(mtime));
     let meta = SharedString::from(if is_dir {
         String::new()
     } else {
@@ -1217,8 +3797,33 @@ fn file_row(
     let name_color = if is_dir { theme.blue } else { theme.text };
     let click_name = name.clone();
     let right_name = name.clone();
+    let row_id = if inline {
+        if is_dir {
+            "inline-new-dir".to_string()
+        } else if name.is_empty() {
+            "inline-new-file".to_string()
+        } else {
+            format!("inline-rename-{}", name)
+        }
+    } else {
+        name.clone()
+    };
+    let name_cell = if let Some(input) = inline_input {
+        div()
+            .flex_1()
+            .px_1()
+            .bg(theme.surface0)
+            .rounded_sm()
+            .child(input)
+    } else {
+        div()
+            .flex_1()
+            .text_sm()
+            .text_color(name_color)
+            .child(display)
+    };
 
-    div()
+    let mut row = div()
         .w_full()
         .px_3()
         .py_1()
@@ -1227,19 +3832,38 @@ fn file_row(
         .gap_3()
         .bg(if selected { theme.surface0 } else { theme.base })
         .cursor_pointer()
-        .id(SharedString::from(name.clone()))
-        .on_click(cx.listener(move |this, event: &ClickEvent, _window, cx| {
-            let modifiers = event.modifiers();
-            let click_count = event.click_count();
-            this.click_file(&click_name, is_dir, modifiers, click_count, cx);
-            cx.stop_propagation();
-        }))
-        .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
-            this.open_menu(Some(right_name.clone()), event.position, cx);
-            cx.stop_propagation();
-        }))
-        .child(div().text_sm().text_color(name_color).child(display))
-        .child(div().text_xs().text_color(theme.muted).child(meta))
+        .id(SharedString::from(row_id));
+    if !inline {
+        row = row
+            .on_click(cx.listener(move |this, event: &ClickEvent, _window, cx| {
+                let modifiers = event.modifiers();
+                let click_count = event.click_count();
+                this.click_file(&click_name, is_dir, modifiers, click_count, cx);
+                cx.stop_propagation();
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                    this.open_menu(Some(right_name.clone()), event.position, cx);
+                    cx.stop_propagation();
+                }),
+            );
+    }
+    row.child(name_cell)
+        .child(
+            div()
+                .w(px(135.0))
+                .text_xs()
+                .text_color(theme.muted)
+                .child(modified),
+        )
+        .child(
+            div()
+                .w(px(80.0))
+                .text_xs()
+                .text_color(theme.muted)
+                .child(meta),
+        )
 }
 
 fn file_name_of(url: &str) -> String {
@@ -1247,6 +3871,236 @@ fn file_name_of(url: &str) -> String {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| url.to_string())
+}
+
+fn normalize_single_path(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("路径不能为空".to_string());
+    }
+    if trimmed.contains(['\r', '\n']) {
+        return Err("只支持粘贴单个目录路径".to_string());
+    }
+
+    let value = if let Some(value) = trimmed.strip_prefix('"') {
+        value
+            .strip_suffix('"')
+            .ok_or_else(|| "路径引号不完整".to_string())?
+    } else if trimmed.ends_with('"') {
+        return Err("路径引号不完整".to_string());
+    } else {
+        trimmed
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("路径不能为空".to_string());
+    }
+    Ok(value.to_string())
+}
+
+fn resolve_address_path(cwd: &str, raw: &str) -> Result<String, String> {
+    let normalized = normalize_single_path(raw)?;
+    let path = std::path::Path::new(&normalized);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::path::Path::new(cwd).join(path)
+    };
+    Ok(path.to_string_lossy().into_owned())
+}
+
+fn normalize_shortcut(raw: &str) -> String {
+    raw.trim().to_ascii_lowercase().replace(' ', "")
+}
+
+fn shortcut_actions() -> [ShortcutAction; 11] {
+    [
+        ShortcutAction::Open,
+        ShortcutAction::Search,
+        ShortcutAction::NewTab,
+        ShortcutAction::CloseTab,
+        ShortcutAction::Delete,
+        ShortcutAction::Rename,
+        ShortcutAction::Copy,
+        ShortcutAction::Cut,
+        ShortcutAction::Paste,
+        ShortcutAction::NewFile,
+        ShortcutAction::NewDir,
+    ]
+}
+
+fn keystroke_to_shortcut(keystroke: &Keystroke) -> Option<String> {
+    let key = keystroke.key.trim().to_ascii_lowercase();
+    if key.is_empty()
+        || matches!(
+            key.as_str(),
+            "shift" | "control" | "ctrl" | "alt" | "platform" | "super" | "win" | "function" | "fn"
+        )
+    {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if keystroke.modifiers.control {
+        parts.push("ctrl");
+    }
+    if keystroke.modifiers.alt {
+        parts.push("alt");
+    }
+    if keystroke.modifiers.shift {
+        parts.push("shift");
+    }
+    if keystroke.modifiers.platform {
+        parts.push("win");
+    }
+    if keystroke.modifiers.function {
+        parts.push("fn");
+    }
+    parts.push(key.as_str());
+    Some(parts.join("+"))
+}
+
+fn shortcut_matches(configured: &str, keystroke: &Keystroke) -> bool {
+    let normalized = normalize_shortcut(configured);
+    let parts: Vec<&str> = normalized.split('+').collect();
+    let Some(key) = parts.last().copied() else {
+        return false;
+    };
+    if key != keystroke.key.as_str() {
+        return false;
+    }
+    let control = parts.contains(&"ctrl") || parts.contains(&"control");
+    let shift = parts.contains(&"shift");
+    let alt = parts.contains(&"alt");
+    let platform = parts.contains(&"win")
+        || parts.contains(&"super")
+        || parts.contains(&"cmd")
+        || parts.contains(&"platform");
+    let function = parts.contains(&"fn") || parts.contains(&"function");
+    control == keystroke.modifiers.control
+        && shift == keystroke.modifiers.shift
+        && alt == keystroke.modifiers.alt
+        && platform == keystroke.modifiers.platform
+        && function == keystroke.modifiers.function
+}
+
+fn reconcile_selection(
+    selected: &mut Vec<String>,
+    anchor: &mut Option<String>,
+    available_names: &[String],
+) {
+    selected.retain(|name| available_names.iter().any(|available| available == name));
+    if anchor
+        .as_ref()
+        .is_some_and(|name| !available_names.iter().any(|available| available == name))
+    {
+        *anchor = None;
+    }
+}
+
+fn refresh_request_matches(refreshing: bool, request_cwd: &str, event_cwd: &str) -> bool {
+    refreshing && request_cwd == event_cwd
+}
+
+fn operation_status(label: &str, success: usize, failed: usize) -> String {
+    match (success, failed) {
+        (0, 0) => format!("{}未执行", label),
+        (_, 0) => format!("{}完成 {} 项", label, success),
+        (0, _) => format!("{}失败 {} 项", label, failed),
+        _ => format!("{}完成 {} 项，失败 {} 项", label, success, failed),
+    }
+}
+
+fn sort_files(files: &mut [FileEntry], sort: SortState) {
+    files.sort_by(|a, b| {
+        let directory_order = b.is_dir.cmp(&a.is_dir);
+        if directory_order != Ordering::Equal {
+            return directory_order;
+        }
+
+        let primary = match sort.field {
+            SortField::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+            SortField::Modified => a.mtime.partial_cmp(&b.mtime).unwrap_or(Ordering::Equal),
+            SortField::Size => a.size.cmp(&b.size),
+        };
+        let primary = match sort.direction {
+            SortDirection::Ascending => primary,
+            SortDirection::Descending => primary.reverse(),
+        };
+        primary
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+}
+
+fn search_directory(root: &Path, query: &str) -> io::Result<Vec<FileEntry>> {
+    let query = query.to_lowercase();
+    let mut results = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            let is_symlink = metadata.file_type().is_symlink();
+            let is_dir = if is_symlink {
+                fs::metadata(&path)
+                    .map(|target| target.is_dir())
+                    .unwrap_or(false)
+            } else {
+                metadata.is_dir()
+            };
+            let relative = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
+            if query.is_empty()
+                || relative.to_lowercase().contains(&query)
+                || entry
+                    .file_name()
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .contains(&query)
+            {
+                let mtime = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|value| value.as_secs_f64())
+                    .unwrap_or(0.0);
+                results.push(FileEntry {
+                    name: relative,
+                    is_dir,
+                    is_hidden: false,
+                    size: if is_dir { 0 } else { metadata.len() },
+                    mtime,
+                });
+            }
+            if is_dir && !is_symlink {
+                pending.push(path);
+            }
+        }
+    }
+    Ok(results)
+}
+
+fn format_mtime(mtime: f64) -> String {
+    if !mtime.is_finite() || mtime <= 0.0 {
+        return String::new();
+    }
+    let utc = match OffsetDateTime::from_unix_timestamp(mtime as i64) {
+        Ok(value) => value,
+        Err(_) => return String::new(),
+    };
+    let offset = match UtcOffset::current_local_offset() {
+        Ok(value) => value,
+        Err(_) => return String::new(),
+    };
+    utc.to_offset(offset)
+        .format(&time::macros::format_description!(
+            "[year]-[month]-[day] [hour]:[minute]"
+        ))
+        .unwrap_or_default()
 }
 
 /// 判断路径是否为盘符根（如 `D:\`、`C:`）。
@@ -1260,32 +4114,396 @@ fn is_drive_root(cwd: &str) -> bool {
     }
 }
 
-static DRIVES: OnceLock<Vec<String>> = OnceLock::new();
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// 扫描存在的磁盘盘符（A-Z），首次调用后缓存。
-fn drives() -> &'static Vec<String> {
-    DRIVES.get_or_init(|| {
-        (b'A'..=b'Z')
-            .map(|c| format!("{}:\\", c as char))
-            .filter(|d| std::path::Path::new(d).exists())
-            .collect()
-    })
+/// 扫描当前可见的磁盘盘符（A-Z）。
+fn scan_drives() -> Vec<String> {
+    (b'A'..=b'Z')
+        .map(|c| format!("{}:\\", c as char))
+        .filter(|drive| Path::new(drive).exists())
+        .collect()
 }
 
-/// 递归复制目录（普通文件 + 子目录，忽略符号链接/权限错误）。
-fn copy_dir_recursive(src: &str, dst: &std::path::Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let path = entry.path();
-        let dest = dst.join(entry.file_name());
-        if path.is_dir() {
-            copy_dir_recursive(&path.to_string_lossy(), &dest)?;
-        } else {
-            std::fs::copy(&path, &dest)?;
+fn is_unc_path(path: &str) -> bool {
+    let extended_prefix = "\\\\?\\";
+    if let Some(rest) = path.strip_prefix(extended_prefix) {
+        return rest
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("UNC\\"));
+    }
+    path.starts_with("\\\\")
+}
+
+fn is_network_path(path: &Path) -> io::Result<bool> {
+    let text = path.to_string_lossy();
+    if is_unc_path(&text) {
+        return Ok(true);
+    }
+
+    #[cfg(windows)]
+    {
+        let drive_path = text.strip_prefix("\\\\?\\").unwrap_or(&text);
+        let mut chars = drive_path.chars();
+        let Some(drive) = chars.next() else {
+            return Ok(false);
+        };
+        if chars.next() != Some(':') || !drive.is_ascii_alphabetic() {
+            return Ok(false);
+        }
+
+        let root = format!("{}:\\", drive);
+        let wide: Vec<u16> = std::ffi::OsStr::new(&root)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let drive_type = unsafe { GetDriveTypeW(wide.as_ptr()) };
+        return match drive_type {
+            DRIVE_REMOTE => Ok(true),
+            0 | 1 => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("无法识别磁盘 {}", drive),
+            )),
+            _ => Ok(false),
+        };
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Ok(false)
+    }
+}
+
+fn network_path_count(paths: &[String]) -> Result<usize, String> {
+    let mut count = 0usize;
+    for path in paths {
+        match is_network_path(Path::new(path)) {
+            Ok(true) => count += 1,
+            Ok(false) => {}
+            Err(error) => {
+                return Err(format!(
+                    "无法判断 {} 的存储类型: {}",
+                    file_name_of(path),
+                    error
+                ));
+            }
         }
     }
-    Ok(())
+    Ok(count)
+}
+
+fn permanent_delete(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
+fn delete_path_with_policy(path: &Path) -> Result<DeleteMode, String> {
+    if is_network_path(path).map_err(|error| error.to_string())? {
+        permanent_delete(path).map_err(|error| error.to_string())?;
+        Ok(DeleteMode::Permanent)
+    } else {
+        trash::delete(path).map_err(|error| error.to_string())?;
+        Ok(DeleteMode::RecycleBin)
+    }
+}
+
+fn delete_paths_with_policy(paths: &[String]) -> DeleteSummary {
+    let mut summary = DeleteSummary {
+        success: 0,
+        failed: 0,
+        permanent_success: 0,
+        first_failure: None,
+    };
+    for path in paths {
+        match delete_path_with_policy(Path::new(path)) {
+            Ok(DeleteMode::Permanent) => {
+                summary.success += 1;
+                summary.permanent_success += 1;
+            }
+            Ok(DeleteMode::RecycleBin) => summary.success += 1,
+            Err(error) => {
+                summary.failed += 1;
+                if summary.first_failure.is_none() {
+                    summary.first_failure = Some(format!("{}: {}", file_name_of(path), error));
+                }
+            }
+        }
+    }
+    summary
+}
+
+fn delete_status(summary: &DeleteSummary) -> String {
+    let mut status = operation_status("删除", summary.success, summary.failed);
+    if summary.permanent_success > 0 {
+        status.push_str(&format!("（永久删除 {} 项）", summary.permanent_success));
+    }
+    if let Some(error) = &summary.first_failure {
+        status.push_str(&format!("，首个失败：{}", error));
+    }
+    status
+}
+
+enum CopyError {
+    Cancelled,
+    Io(String),
+}
+
+impl From<io::Error> for CopyError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error.to_string())
+    }
+}
+
+fn copy_paths_with_progress(
+    paths: &[String],
+    dest: &str,
+    cancel: &AtomicBool,
+    tx: &UnboundedSender<TransferUpdate>,
+) -> TransferOutcome {
+    let total_bytes = match paths.iter().try_fold(0u64, |total, path| {
+        copy_entry_size(Path::new(path), cancel).map(|size| total.saturating_add(size))
+    }) {
+        Ok(total) => total,
+        Err(CopyError::Cancelled) => return TransferOutcome::Cancelled { success: 0 },
+        Err(CopyError::Io(message)) => {
+            return TransferOutcome::Failed {
+                success: 0,
+                message,
+            };
+        }
+    };
+
+    let _ = tx.send(TransferUpdate::Progress {
+        total_bytes,
+        completed_bytes: 0,
+        completed_items: 0,
+        current: "准备复制".to_string(),
+    });
+
+    let mut completed_bytes = 0u64;
+    let mut completed_items = 0usize;
+    for source in paths {
+        if cancel.load(AtomicOrdering::Relaxed) {
+            return TransferOutcome::Cancelled {
+                success: completed_items,
+            };
+        }
+
+        let source_path = Path::new(source);
+        let name = file_name_of(source);
+        let destination = Path::new(dest).join(&name);
+        let result = copy_entry_with_progress(
+            source_path,
+            &destination,
+            &name,
+            cancel,
+            tx,
+            total_bytes,
+            completed_items,
+            &mut completed_bytes,
+        );
+        match result {
+            Ok(()) => {
+                completed_items += 1;
+                let _ = tx.send(TransferUpdate::Progress {
+                    total_bytes,
+                    completed_bytes,
+                    completed_items,
+                    current: name,
+                });
+            }
+            Err(CopyError::Cancelled) => {
+                return TransferOutcome::Cancelled {
+                    success: completed_items,
+                };
+            }
+            Err(CopyError::Io(message)) => {
+                return TransferOutcome::Failed {
+                    success: completed_items,
+                    message,
+                };
+            }
+        }
+    }
+
+    TransferOutcome::Completed {
+        success: completed_items,
+    }
+}
+
+fn copy_entry_size(path: &Path, cancel: &AtomicBool) -> Result<u64, CopyError> {
+    if cancel.load(AtomicOrdering::Relaxed) {
+        return Err(CopyError::Cancelled);
+    }
+    let metadata = fs::metadata(path)?;
+    if !metadata.is_dir() {
+        return Ok(metadata.len());
+    }
+    let mut total = 0u64;
+    for entry in fs::read_dir(path)? {
+        total = total.saturating_add(copy_entry_size(&entry?.path(), cancel)?);
+    }
+    Ok(total)
+}
+
+fn copy_entry_with_progress(
+    source: &Path,
+    destination: &Path,
+    current: &str,
+    cancel: &AtomicBool,
+    tx: &UnboundedSender<TransferUpdate>,
+    total_bytes: u64,
+    completed_items: usize,
+    completed_bytes: &mut u64,
+) -> Result<(), CopyError> {
+    if cancel.load(AtomicOrdering::Relaxed) {
+        return Err(CopyError::Cancelled);
+    }
+    if same_path(source, destination) {
+        return Err(CopyError::Io("源文件和目标文件相同".to_string()));
+    }
+    if fs::metadata(source)?.is_dir() {
+        fs::create_dir_all(destination)?;
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            let child_destination = destination.join(entry.file_name());
+            copy_entry_with_progress(
+                &entry.path(),
+                &child_destination,
+                current,
+                cancel,
+                tx,
+                total_bytes,
+                completed_items,
+                completed_bytes,
+            )?;
+        }
+        Ok(())
+    } else {
+        copy_file_with_progress(
+            source,
+            destination,
+            current,
+            cancel,
+            tx,
+            total_bytes,
+            completed_items,
+            completed_bytes,
+        )
+    }
+}
+
+fn copy_file_with_progress(
+    source: &Path,
+    destination: &Path,
+    current: &str,
+    cancel: &AtomicBool,
+    tx: &UnboundedSender<TransferUpdate>,
+    total_bytes: u64,
+    completed_items: usize,
+    completed_bytes: &mut u64,
+) -> Result<(), CopyError> {
+    if same_path(source, destination) {
+        return Err(CopyError::Io("源文件和目标文件相同".to_string()));
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let temporary = temporary_path(destination);
+    let result = (|| {
+        let mut input = File::open(source)?;
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        let mut buffer = vec![0u8; 1024 * 1024];
+
+        loop {
+            if cancel.load(AtomicOrdering::Relaxed) {
+                return Err(CopyError::Cancelled);
+            }
+            let read = input.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            output.write_all(&buffer[..read])?;
+            *completed_bytes = completed_bytes.saturating_add(read as u64);
+            let _ = tx.send(TransferUpdate::Progress {
+                total_bytes,
+                completed_bytes: *completed_bytes,
+                completed_items,
+                current: current.to_string(),
+            });
+        }
+        output.flush()?;
+        drop(output);
+        if cancel.load(AtomicOrdering::Relaxed) {
+            return Err(CopyError::Cancelled);
+        }
+        commit_staged_file(&temporary, destination)?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+fn temporary_path(destination: &Path) -> PathBuf {
+    let name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("item");
+    loop {
+        let id = TEMP_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
+        let candidate = destination.with_file_name(format!(
+            ".{}.yazi-gui-copying-{}-{}",
+            name,
+            std::process::id(),
+            id
+        ));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+}
+
+fn commit_staged_file(temporary: &Path, destination: &Path) -> io::Result<()> {
+    if !destination.exists() {
+        return fs::rename(temporary, destination);
+    }
+    if destination.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "目标位置已有同名目录",
+        ));
+    }
+
+    let backup = temporary_path(destination);
+    fs::rename(destination, &backup)?;
+    match fs::rename(temporary, destination) {
+        Ok(()) => {
+            let _ = fs::remove_file(backup);
+            Ok(())
+        }
+        Err(error) => {
+            let _ = fs::rename(&backup, destination);
+            Err(error)
+        }
+    }
 }
 
 fn is_image_file(path: &str) -> bool {
@@ -1295,7 +4513,8 @@ fn is_image_file(path: &str) -> bool {
         .map(|ext| {
             matches!(
                 ext.to_ascii_lowercase().as_str(),
-                "png" | "jpg"
+                "png"
+                    | "jpg"
                     | "jpeg"
                     | "gif"
                     | "webp"
@@ -1373,9 +4592,7 @@ fn syntect_to_gpui_style(style: syntect::highlighting::Style) -> HighlightStyle 
     use syntect::highlighting::FontStyle as SynFontStyle;
     let c = style.foreground;
     HighlightStyle {
-        color: Some(
-            rgb(((c.r as u32) << 16) | ((c.g as u32) << 8) | (c.b as u32)).into(),
-        ),
+        color: Some(rgb(((c.r as u32) << 16) | ((c.g as u32) << 8) | (c.b as u32)).into()),
         font_weight: if style.font_style.contains(SynFontStyle::BOLD) {
             Some(FontWeight::BOLD)
         } else {
@@ -1434,18 +4651,335 @@ fn human_size(bytes: u64) -> String {
 }
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    let background = std::env::args().any(|arg| arg == "--background");
+    Application::new().run(move |cx: &mut App| {
+        cx.bind_keys([
+            KeyBinding::new("backspace", Backspace, None),
+            KeyBinding::new("delete", Delete, None),
+            KeyBinding::new("left", Left, None),
+            KeyBinding::new("right", Right, None),
+            KeyBinding::new("shift-left", SelectLeft, None),
+            KeyBinding::new("shift-right", SelectRight, None),
+            KeyBinding::new("ctrl-a", SelectAll, None),
+            KeyBinding::new("ctrl-c", CopyText, None),
+            KeyBinding::new("ctrl-v", PasteText, None),
+            KeyBinding::new("ctrl-x", CutText, None),
+            KeyBinding::new("home", Home, None),
+            KeyBinding::new("end", End, None),
+        ]);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::centered(size(px(1000.0), px(650.0)), cx)),
+                show: !background,
+                focus: !background,
                 titlebar: Some(TitlebarOptions {
                     title: Some("yazi-gui".into()),
                     ..Default::default()
                 }),
                 ..Default::default()
             },
-            |_window, cx| cx.new(|cx| Root::new(cx)),
+            |window, cx| {
+                let root = cx.new(|cx| Root::new(cx));
+                let window_handle = gpui::Window::window_handle(window);
+                root.update(cx, |root, _cx| {
+                    root.window_handle = Some(window_handle);
+                });
+                root.update(cx, |root, cx| {
+                    let focus_handle = root.focus_handle.clone();
+                    root.input_blur_subscription =
+                        Some(cx.on_blur(&focus_handle, window, |this, _window, cx| {
+                            if this.is_inline_editing() {
+                                this.confirm_input(cx);
+                            }
+                        }));
+                });
+                let weak = root.downgrade();
+                window.on_window_should_close(cx, move |window, cx| {
+                    weak.update(cx, |root, cx| root.handle_window_close(window, cx))
+                        .unwrap_or(true)
+                });
+                root
+            },
         )
         .unwrap();
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DeleteSummary, FileEntry, SortDirection, SortField, SortState, TransferOutcome,
+        copy_paths_with_progress, delete_status, format_mtime, is_unc_path, keystroke_to_shortcut,
+        normalize_shortcut, normalize_single_path, permanent_delete, reconcile_selection,
+        refresh_request_matches, resolve_address_path, search_directory, sort_files,
+    };
+    use std::fs;
+    use std::sync::atomic::AtomicBool;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    fn entry(name: &str, is_dir: bool, size: u64, mtime: f64) -> FileEntry {
+        FileEntry {
+            name: name.to_string(),
+            is_dir,
+            is_hidden: false,
+            size,
+            mtime,
+        }
+    }
+
+    #[test]
+    fn normalizes_a_quoted_single_path() {
+        assert_eq!(
+            normalize_single_path(r#""D:\Projects\gui_for_yazi""#).unwrap(),
+            r"D:\Projects\gui_for_yazi"
+        );
+    }
+
+    #[test]
+    fn rejects_multiline_paths() {
+        assert!(normalize_single_path("D:\\one\r\nD:\\two").is_err());
+    }
+
+    #[test]
+    fn resolves_relative_paths_from_the_active_directory() {
+        assert_eq!(
+            resolve_address_path(r"D:\Projects\gui_for_yazi", "assets").unwrap(),
+            r"D:\Projects\gui_for_yazi\assets"
+        );
+    }
+
+    #[test]
+    fn preserves_absolute_paths() {
+        assert_eq!(
+            resolve_address_path(r"D:\Projects\gui_for_yazi", r"C:\Temp").unwrap(),
+            r"C:\Temp"
+        );
+    }
+
+    #[test]
+    fn sorts_directories_first_and_toggles_fields() {
+        let mut files = vec![
+            entry("z.txt", false, 3, 10.0),
+            entry("a-dir", true, 0, 1.0),
+            entry("b.txt", false, 1, 20.0),
+            entry("A-dir-2", true, 0, 2.0),
+        ];
+
+        sort_files(&mut files, SortState::default());
+        assert_eq!(
+            files
+                .iter()
+                .map(|file| file.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a-dir", "A-dir-2", "b.txt", "z.txt"]
+        );
+
+        sort_files(
+            &mut files,
+            SortState {
+                field: SortField::Size,
+                direction: SortDirection::Descending,
+            },
+        );
+        assert_eq!(
+            files
+                .iter()
+                .map(|file| file.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a-dir", "A-dir-2", "z.txt", "b.txt"]
+        );
+    }
+
+    #[test]
+    fn missing_mtime_is_not_displayed() {
+        assert_eq!(format_mtime(0.0), "");
+        assert_eq!(format_mtime(-1.0), "");
+    }
+
+    #[test]
+    fn recognizes_unc_and_extended_unc_paths() {
+        assert!(is_unc_path(r"\\server\share\file.txt"));
+        assert!(is_unc_path(r"\\?\UNC\server\share\file.txt"));
+        assert!(!is_unc_path(r"\\?\C:\file.txt"));
+        assert!(!is_unc_path(r"D:\file.txt"));
+    }
+
+    #[test]
+    fn reconciles_selection_and_anchor_after_refresh() {
+        let mut selected = vec!["keep.txt".to_string(), "gone.txt".to_string()];
+        let mut anchor = Some("gone.txt".to_string());
+        let available = vec!["keep.txt".to_string(), "new.txt".to_string()];
+
+        reconcile_selection(&mut selected, &mut anchor, &available);
+
+        assert_eq!(selected, vec!["keep.txt"]);
+        assert_eq!(anchor, None);
+    }
+
+    #[test]
+    fn permanent_delete_removes_files_and_directories() {
+        let root = std::env::temp_dir().join(format!(
+            "yazi-gui-delete-test-{}-{}",
+            std::process::id(),
+            super::TEMP_SEQUENCE.fetch_add(1, super::AtomicOrdering::Relaxed)
+        ));
+        let file = root.join("file.txt");
+        let directory = root.join("directory");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(&file, b"delete me").unwrap();
+        fs::write(directory.join("nested.txt"), b"delete me too").unwrap();
+
+        permanent_delete(&file).unwrap();
+        permanent_delete(&directory).unwrap();
+
+        assert!(!file.exists());
+        assert!(!directory.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn delete_status_reports_first_failure_and_permanent_count() {
+        let status = delete_status(&DeleteSummary {
+            success: 2,
+            failed: 1,
+            permanent_success: 1,
+            first_failure: Some("remote.txt: access denied".to_string()),
+        });
+
+        assert_eq!(
+            status,
+            "删除完成 2 项，失败 1 项（永久删除 1 项），首个失败：remote.txt: access denied"
+        );
+    }
+
+    #[test]
+    fn copy_reports_bytes_and_commits_the_target() {
+        let root = std::env::temp_dir().join(format!(
+            "yazi-gui-copy-test-{}-{}",
+            std::process::id(),
+            super::TEMP_SEQUENCE.fetch_add(1, super::AtomicOrdering::Relaxed)
+        ));
+        let source_dir = root.join("source");
+        let destination_dir = root.join("destination");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&destination_dir).unwrap();
+        let source = source_dir.join("data.bin");
+        fs::write(&source, vec![7u8; 2_500_000]).unwrap();
+
+        let (tx, mut rx) = unbounded_channel();
+        let outcome = copy_paths_with_progress(
+            &[source.to_string_lossy().into_owned()],
+            &destination_dir.to_string_lossy(),
+            &AtomicBool::new(false),
+            &tx,
+        );
+        drop(tx);
+
+        let mut saw_byte_progress = false;
+        while let Ok(update) = rx.try_recv() {
+            if let super::TransferUpdate::Progress {
+                completed_bytes, ..
+            } = update
+            {
+                saw_byte_progress |= completed_bytes > 0;
+            }
+        }
+        assert!(matches!(outcome, TransferOutcome::Completed { success: 1 }));
+        assert!(saw_byte_progress);
+        assert_eq!(
+            fs::metadata(destination_dir.join("data.bin"))
+                .unwrap()
+                .len(),
+            2_500_000
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cancelled_copy_does_not_leave_a_destination_file() {
+        let root = std::env::temp_dir().join(format!(
+            "yazi-gui-cancel-test-{}-{}",
+            std::process::id(),
+            super::TEMP_SEQUENCE.fetch_add(1, super::AtomicOrdering::Relaxed)
+        ));
+        let source_dir = root.join("source");
+        let destination_dir = root.join("destination");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&destination_dir).unwrap();
+        let source = source_dir.join("data.bin");
+        fs::write(&source, vec![3u8; 32]).unwrap();
+
+        let (tx, _rx) = unbounded_channel();
+        let cancel = AtomicBool::new(true);
+        let outcome = copy_paths_with_progress(
+            &[source.to_string_lossy().into_owned()],
+            &destination_dir.to_string_lossy(),
+            &cancel,
+            &tx,
+        );
+
+        assert!(matches!(outcome, TransferOutcome::Cancelled { success: 0 }));
+        assert!(!destination_dir.join("data.bin").exists());
+        assert_eq!(fs::read_dir(&destination_dir).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn refresh_completes_only_for_the_requested_directory() {
+        assert!(refresh_request_matches(
+            true,
+            r"D:\Projects\gui_for_yazi",
+            r"D:\Projects\gui_for_yazi"
+        ));
+        assert!(!refresh_request_matches(
+            true,
+            r"D:\Projects\gui_for_yazi",
+            r"D:\Projects\gui_for_yazi\assets"
+        ));
+        assert!(!refresh_request_matches(
+            false,
+            r"D:\Projects\gui_for_yazi",
+            r"D:\Projects\gui_for_yazi"
+        ));
+    }
+
+    #[test]
+    fn normalizes_editable_shortcuts() {
+        assert_eq!(normalize_shortcut(" Ctrl + Shift + N "), "ctrl+shift+n");
+        assert_eq!(normalize_shortcut("F2"), "f2");
+        let keystroke = gpui::Keystroke::parse("ctrl-shift-f").unwrap();
+        assert_eq!(
+            keystroke_to_shortcut(&keystroke),
+            Some("ctrl+shift+f".to_string())
+        );
+    }
+
+    #[test]
+    fn searches_case_insensitive_names_and_relative_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "yazi-gui-search-test-{}-{}",
+            std::process::id(),
+            super::TEMP_SEQUENCE.fetch_add(1, super::AtomicOrdering::Relaxed)
+        ));
+        fs::create_dir_all(root.join("NestedFolder")).unwrap();
+        fs::write(root.join("NestedFolder").join("Report.TXT"), b"report").unwrap();
+        fs::write(root.join("visible.bin"), b"visible").unwrap();
+
+        let results = search_directory(&root, "report").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "NestedFolder\\Report.TXT");
+
+        let folder_results = search_directory(&root, "nestedfolder").unwrap();
+        assert!(
+            folder_results
+                .iter()
+                .any(|result| result.name == "NestedFolder" && result.is_dir)
+        );
+        assert!(
+            folder_results
+                .iter()
+                .any(|result| result.name == "NestedFolder\\Report.TXT")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 }

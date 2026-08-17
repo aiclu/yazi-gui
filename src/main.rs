@@ -65,18 +65,23 @@ impl Root {
                 }
             }
             YaziEvent::Hover { url, .. } => {
-                self.hovered = url;
+                self.set_hovered(url, cx);
             }
             YaziEvent::GuiFiles { cwd, files, hovered } => {
                 self.cwd = cwd;
                 self.files = files;
-                if self.hovered != hovered {
-                    self.hovered = hovered.clone();
-                    self.trigger_preview(hovered, cx);
-                }
+                self.set_hovered(hovered, cx);
             }
             _ => {}
         }
+    }
+
+    fn set_hovered(&mut self, url: Option<String>, cx: &mut Context<Self>) {
+        if self.hovered == url {
+            return;
+        }
+        self.hovered = url.clone();
+        self.trigger_preview(url, cx);
     }
 
     fn trigger_preview(&mut self, hovered: Option<String>, cx: &mut Context<Self>) {
@@ -111,7 +116,11 @@ impl Root {
         self.preview = Preview::Loading;
 
         cx.spawn(async move |weak, cx| {
-            let bytes = tokio::fs::read(&path).await.ok();
+            let path2 = path.clone();
+            let bytes = cx
+                .background_executor()
+                .spawn(async move { std::fs::read(&path2).ok() })
+                .await;
             let text = bytes.and_then(|b| {
                 if is_probably_text(&b) {
                     Some(String::from_utf8_lossy(&b).into_owned())

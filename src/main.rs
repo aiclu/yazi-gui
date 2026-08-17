@@ -20,6 +20,55 @@ enum Preview {
     Text(String),
 }
 
+/// 界面配色主题。颜色采用 Catppuccin 色板。
+#[derive(Clone, Copy)]
+struct Theme {
+    name: &'static str,
+    base: Hsla,
+    mantle: Hsla,
+    surface0: Hsla,
+    crust: Hsla,
+    surface1: Hsla,
+    text: Hsla,
+    muted: Hsla,
+    blue: Hsla,
+    syntax_theme: &'static str,
+}
+
+impl Theme {
+    /// 暗色（Catppuccin Mocha）。
+    fn dark() -> Self {
+        Theme {
+            name: "暗色",
+            base: rgb(0x1e1e2e).into(),
+            mantle: rgb(0x181825).into(),
+            surface0: rgb(0x313244).into(),
+            crust: rgb(0x11111b).into(),
+            surface1: rgb(0x45475a).into(),
+            text: rgb(0xcdd6f4).into(),
+            muted: rgb(0x6c7086).into(),
+            blue: rgb(0x89b4fa).into(),
+            syntax_theme: "base16-ocean.dark",
+        }
+    }
+
+    /// 浅色（Catppuccin Latte）。
+    fn light() -> Self {
+        Theme {
+            name: "浅色",
+            base: rgb(0xeff1f5).into(),
+            mantle: rgb(0xe6e9ef).into(),
+            surface0: rgb(0xccd0da).into(),
+            crust: rgb(0xdce0e8).into(),
+            surface1: rgb(0xbcc0cc).into(),
+            text: rgb(0x4c4f69).into(),
+            muted: rgb(0x8c8fa1).into(),
+            blue: rgb(0x1e66f5).into(),
+            syntax_theme: "InspiredGitHub",
+        }
+    }
+}
+
 /// 输入模式下的待处理操作。
 enum PendingOp {
     Rename { path: String },
@@ -37,6 +86,7 @@ struct Root {
     focus_handle: FocusHandle,
     pending: Option<PendingOp>,
     input: String,
+    theme: Theme,
 }
 
 impl Root {
@@ -51,6 +101,7 @@ impl Root {
             focus_handle: cx.focus_handle(),
             pending: None,
             input: String::new(),
+            theme: Theme::dark(),
         };
         root.start_yazi(cx);
         root
@@ -138,6 +189,7 @@ impl Root {
             return;
         }
         self.preview = Preview::Loading;
+        let syntax_theme = self.theme.syntax_theme;
 
         cx.spawn(async move |weak, cx| {
             let path2 = path.clone();
@@ -152,7 +204,7 @@ impl Root {
                     let text = String::from_utf8_lossy(&bytes).into_owned();
                     let truncated = truncate_preview(&text);
                     let ext = extension_of(&path2);
-                    let highlights = highlight_code(&truncated, &ext);
+                    let highlights = highlight_code(&truncated, &ext, syntax_theme);
                     Some((truncated, highlights))
                 })
                 .await;
@@ -185,6 +237,14 @@ impl Root {
 
     fn go_parent(&self) {
         self.send(&["cd", ".."]);
+    }
+
+    fn toggle_theme(&mut self, cx: &mut Context<Self>) {
+        self.theme = match self.theme.syntax_theme {
+            "InspiredGitHub" => Theme::dark(),
+            _ => Theme::light(),
+        };
+        cx.notify();
     }
 
     fn reveal(&self, name: &str) {
@@ -334,7 +394,7 @@ impl Root {
             .w_full()
             .px_3()
             .py_1()
-            .bg(rgb(0x45475a))
+            .bg(self.theme.surface1)
             .text_sm()
             .child(SharedString::from(format!("{}: {}_", label, text)))
     }
@@ -351,13 +411,14 @@ impl Render for Root {
         let cwd = SharedString::from(self.cwd.clone());
         let status = SharedString::from(format!("{} 项", self.files.len()));
         let focus_handle = self.focus_handle.clone();
+        let theme = self.theme;
 
         div()
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(0x1e1e2e))
-            .text_color(rgb(0xcdd6f4))
+            .bg(theme.base)
+            .text_color(theme.text)
             .id("root")
             .track_focus(&focus_handle)
             .on_key_down(cx.listener(|this, event, _window, cx| {
@@ -368,29 +429,30 @@ impl Render for Root {
                     .w_full()
                     .px_3()
                     .py_2()
-                    .bg(rgb(0x11111b))
+                    .bg(theme.crust)
                     .flex()
                     .items_center()
                     .gap_3()
                     .child(div().flex_1().text_sm().child(cwd))
-                    .child(parent_button(cx)),
+                    .child(parent_button(cx, theme)),
             )
             .child(
                 div()
                     .w_full()
                     .px_3()
                     .py_1()
-                    .bg(rgb(0x181825))
+                    .bg(theme.mantle)
                     .flex()
                     .gap_2()
-                    .child(action_button(cx, "btn-open", "打开", |this, _w, cx| this.open_hovered(cx)))
-                    .child(action_button(cx, "btn-delete", "删除", |this, _w, cx| this.delete_hovered(cx)))
-                    .child(action_button(cx, "btn-rename", "重命名", |this, w, cx| this.start_rename(w, cx)))
-                    .child(action_button(cx, "btn-yank", "复制", |this, _w, _cx| this.send(&["yank"])))
-                    .child(action_button(cx, "btn-cut", "剪切", |this, _w, _cx| this.send(&["cut"])))
-                    .child(action_button(cx, "btn-paste", "粘贴", |this, _w, _cx| this.send(&["paste"])))
-                    .child(action_button(cx, "btn-newfile", "新建文件", |this, w, cx| this.start_new_file(w, cx)))
-                    .child(action_button(cx, "btn-newdir", "新建文件夹", |this, w, cx| this.start_new_dir(w, cx))),
+                    .child(action_button(cx, theme, "btn-open", "打开", |this, _w, cx| this.open_hovered(cx)))
+                    .child(action_button(cx, theme, "btn-delete", "删除", |this, _w, cx| this.delete_hovered(cx)))
+                    .child(action_button(cx, theme, "btn-rename", "重命名", |this, w, cx| this.start_rename(w, cx)))
+                    .child(action_button(cx, theme, "btn-yank", "复制", |this, _w, _cx| this.send(&["yank"])))
+                    .child(action_button(cx, theme, "btn-cut", "剪切", |this, _w, _cx| this.send(&["cut"])))
+                    .child(action_button(cx, theme, "btn-paste", "粘贴", |this, _w, _cx| this.send(&["paste"])))
+                    .child(action_button(cx, theme, "btn-newfile", "新建文件", |this, w, cx| this.start_new_file(w, cx)))
+                    .child(action_button(cx, theme, "btn-newdir", "新建文件夹", |this, w, cx| this.start_new_dir(w, cx)))
+                    .child(action_button(cx, theme, "btn-theme", theme.name, |this, _w, cx| this.toggle_theme(cx))),
             )
             .child(self.input_bar())
             .child(
@@ -399,7 +461,7 @@ impl Render for Root {
                     .flex_1()
                     .flex_row()
                     .child(self.file_list(cx))
-                    .child(div().w(px(1.0)).bg(rgb(0x313244)))
+                    .child(div().w(px(1.0)).bg(theme.surface0))
                     .child(self.preview_pane()),
             )
             .child(
@@ -407,9 +469,9 @@ impl Render for Root {
                     .w_full()
                     .px_3()
                     .py_1()
-                    .bg(rgb(0x11111b))
+                    .bg(theme.crust)
                     .text_xs()
-                    .text_color(rgb(0x6c7086))
+                    .text_color(theme.muted)
                     .child(status),
             )
     }
@@ -426,7 +488,7 @@ impl Root {
                 let is_dir = f.is_dir;
                 let size = f.size;
                 let hovered = is_hovered(&self.hovered, &self.cwd, &name);
-                file_row(cx, name, is_dir, size, hovered)
+                file_row(cx, self.theme, name, is_dir, size, hovered)
             }))
     }
 
@@ -442,14 +504,14 @@ impl Root {
             .flex_1()
             .flex()
             .flex_col()
-            .bg(rgb(0x181825))
+            .bg(self.theme.mantle)
             .child(
                 div()
                     .px_3()
                     .py_2()
-                    .bg(rgb(0x11111b))
+                    .bg(self.theme.crust)
                     .text_sm()
-                    .text_color(rgb(0x6c7086))
+                    .text_color(self.theme.muted)
                     .child(title),
             )
             .child(
@@ -467,12 +529,12 @@ impl Root {
         match &self.preview {
             Preview::Empty => div()
                 .text_sm()
-                .text_color(rgb(0x6c7086))
+                .text_color(self.theme.muted)
                 .child("悬停文件以预览")
                 .into_any_element(),
             Preview::Loading => div()
                 .text_sm()
-                .text_color(rgb(0x6c7086))
+                .text_color(self.theme.muted)
                 .child("加载中...")
                 .into_any_element(),
             Preview::Dir => div().text_sm().child("目录").into_any_element(),
@@ -502,11 +564,11 @@ impl Root {
     }
 }
 
-fn parent_button(cx: &mut Context<Root>) -> impl IntoElement {
+fn parent_button(cx: &mut Context<Root>, theme: Theme) -> impl IntoElement {
     div()
         .px_2()
         .py_1()
-        .bg(rgb(0x313244))
+        .bg(theme.surface0)
         .rounded_md()
         .cursor_pointer()
         .text_sm()
@@ -519,6 +581,7 @@ fn parent_button(cx: &mut Context<Root>) -> impl IntoElement {
 
 fn action_button(
     cx: &mut Context<Root>,
+    theme: Theme,
     id: &'static str,
     label: &'static str,
     on_click: impl Fn(&mut Root, &mut Window, &mut Context<Root>) + 'static,
@@ -526,7 +589,7 @@ fn action_button(
     div()
         .px_2()
         .py_1()
-        .bg(rgb(0x313244))
+        .bg(theme.surface0)
         .rounded_md()
         .cursor_pointer()
         .text_sm()
@@ -539,6 +602,7 @@ fn action_button(
 
 fn file_row(
     cx: &Context<Root>,
+    theme: Theme,
     name: String,
     is_dir: bool,
     size: u64,
@@ -555,11 +619,7 @@ fn file_row(
     } else {
         human_size(size)
     });
-    let name_color = if is_dir {
-        rgb(0x89b4fa)
-    } else {
-        rgb(0xcdd6f4)
-    };
+    let name_color = if is_dir { theme.blue } else { theme.text };
     let hover_name = name.clone();
 
     div()
@@ -569,7 +629,7 @@ fn file_row(
         .flex()
         .justify_between()
         .gap_3()
-        .bg(if hovered { rgb(0x313244) } else { rgb(0x1e1e2e) })
+        .bg(if hovered { theme.surface0 } else { theme.base })
         .cursor_pointer()
         .id(SharedString::from(name.clone()))
         .on_hover(cx.listener(move |this, hovered, _window, _cx| {
@@ -583,7 +643,7 @@ fn file_row(
             }
         }))
         .child(div().text_sm().text_color(name_color).child(display))
-        .child(div().text_xs().text_color(rgb(0x6c7086)).child(meta))
+        .child(div().text_xs().text_color(theme.muted).child(meta))
 }
 
 fn is_hovered(hovered: &Option<String>, cwd: &str, name: &str) -> bool {
@@ -705,13 +765,17 @@ fn syntect_to_gpui_style(style: syntect::highlighting::Style) -> HighlightStyle 
 }
 
 /// 对文本做语法高亮，返回字节区间 -> 高亮样式。无匹配语法时返回 None。
-fn highlight_code(text: &str, ext: &str) -> Option<Vec<(Range<usize>, HighlightStyle)>> {
+fn highlight_code(
+    text: &str,
+    ext: &str,
+    syntax_theme: &str,
+) -> Option<Vec<(Range<usize>, HighlightStyle)>> {
     use syntect::easy::HighlightLines;
     use syntect::util::LinesWithEndings;
 
     let ss = syntax_set();
     let syntax = ss.find_syntax_by_extension(ext)?;
-    let theme = theme_set().themes.get("base16-ocean.dark")?;
+    let theme = theme_set().themes.get(syntax_theme)?;
     let mut highlighter = HighlightLines::new(syntax, theme);
 
     let mut highlights = Vec::new();

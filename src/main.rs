@@ -567,6 +567,53 @@ impl Root {
         cx.notify();
     }
 
+    // ---- 多标签 ----
+
+    fn switch_tab(&mut self, i: usize, cx: &mut Context<Self>) {
+        if i == self.active || i >= self.tabs.len() {
+            return;
+        }
+        self.active = i;
+        self.preview = Preview::Empty;
+        self.preview_path = None;
+        let cwd = self.tabs[i].cwd.clone();
+        self.send(&["cd", cwd.as_str()]);
+        cx.notify();
+    }
+
+    fn new_tab(&mut self, cx: &mut Context<Self>) {
+        let cwd = self.cur().cwd.clone();
+        self.tabs.push(Tab::new(&cwd));
+        self.active = self.tabs.len() - 1;
+        self.preview = Preview::Empty;
+        self.preview_path = None;
+        self.send(&["cd", cwd.as_str()]);
+        cx.notify();
+    }
+
+    fn close_tab(&mut self, i: usize, cx: &mut Context<Self>) {
+        if i >= self.tabs.len() {
+            return;
+        }
+        if self.tabs.len() == 1 {
+            cx.quit();
+            return;
+        }
+        self.tabs.remove(i);
+        let len = self.tabs.len();
+        if self.active > i {
+            self.active -= 1;
+        }
+        if self.active >= len {
+            self.active = len - 1;
+        }
+        self.preview = Preview::Empty;
+        self.preview_path = None;
+        let cwd = self.tabs[self.active].cwd.clone();
+        self.send(&["cd", cwd.as_str()]);
+        cx.notify();
+    }
+
     // ---- 输入模式（重命名 / 新建） ----
 
     fn start_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -640,9 +687,38 @@ impl Root {
         .detach();
     }
 
-    fn on_input_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+    fn on_input_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.pending.is_some() {
             self.handle_typing(event, cx);
+        } else {
+            self.handle_shortcut(event, window, cx);
+        }
+    }
+
+    fn handle_shortcut(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let ks = &event.keystroke;
+        let ctrl = ks.modifiers.control;
+        match ks.key.as_str() {
+            "t" if ctrl => self.new_tab(cx),
+            "w" if ctrl => self.close_tab(self.active, cx),
+            "a" if ctrl => {
+                let names: Vec<String> = self.cur().files.iter().map(|f| f.name.clone()).collect();
+                self.cur_mut().selected = names;
+                self.preview = Preview::Empty;
+                self.preview_path = None;
+                cx.notify();
+            }
+            "delete" => self.delete_selected(cx),
+            "f2" => self.start_rename(window, cx),
+            "backspace" => self.go_parent(),
+            "escape" => {
+                if self.menu.is_some() {
+                    self.close_menu(cx);
+                } else if !self.cur().selected.is_empty() {
+                    self.click_blank(cx);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -684,6 +760,29 @@ impl Root {
             .bg(self.theme.surface1)
             .text_sm()
             .child(SharedString::from(format!("{}: {}_", label, text)))
+    }
+
+    fn tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        div()
+            .w_full()
+            .px_2()
+            .py_1()
+            .bg(theme.crust)
+            .flex()
+            .items_center()
+            .gap_1()
+            .children(
+                self.tabs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, tab)| {
+                        let active = i == self.active;
+                        let name = SharedString::from(tab_name(&tab.cwd));
+                        tab_button(cx, theme, i, name, active)
+                    }),
+            )
+            .child(new_tab_button(cx, theme))
     }
 
     fn context_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -739,9 +838,10 @@ impl Render for Root {
             .text_color(theme.text)
             .id("root")
             .track_focus(&focus_handle)
-            .on_key_down(cx.listener(|this, event, _window, cx| {
-                this.on_input_key(event, cx);
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                this.on_input_key(event, window, cx);
             }))
+            .child(self.tab_bar(cx))
             .child(
                 div()
                     .w_full()
@@ -889,6 +989,69 @@ impl Root {
                 .into_any_element(),
         }
     }
+}
+
+fn tab_name(cwd: &str) -> String {
+    let name = file_name_of(cwd);
+    if name.is_empty() {
+        cwd.to_string()
+    } else {
+        name
+    }
+}
+
+fn tab_button(
+    cx: &mut Context<Root>,
+    theme: Theme,
+    i: usize,
+    name: SharedString,
+    active: bool,
+) -> AnyElement {
+    div()
+        .px_2()
+        .py_1()
+        .bg(if active { theme.mantle } else { theme.surface0 })
+        .rounded_md()
+        .cursor_pointer()
+        .flex()
+        .items_center()
+        .gap_2()
+        .id(SharedString::from(format!("tab-{}", i)))
+        .on_click(cx.listener(move |this, _e, _w, cx| {
+            this.switch_tab(i, cx);
+        }))
+        .on_mouse_down(MouseButton::Middle, cx.listener(move |this, _e, _w, cx| {
+            this.close_tab(i, cx);
+            cx.stop_propagation();
+        }))
+        .child(div().text_sm().child(name))
+        .child(
+            div()
+                .px_1()
+                .cursor_pointer()
+                .child("×")
+                .id(SharedString::from(format!("tab-close-{}", i)))
+                .on_click(cx.listener(move |this, _e, _w, cx| {
+                    this.close_tab(i, cx);
+                    cx.stop_propagation();
+                })),
+        )
+        .into_any_element()
+}
+
+fn new_tab_button(cx: &mut Context<Root>, theme: Theme) -> impl IntoElement {
+    div()
+        .px_2()
+        .py_1()
+        .bg(theme.surface0)
+        .rounded_md()
+        .cursor_pointer()
+        .text_sm()
+        .child("+")
+        .id("btn-new-tab")
+        .on_click(cx.listener(|this, _e, _w, cx| {
+            this.new_tab(cx);
+        }))
 }
 
 fn parent_button(cx: &mut Context<Root>, theme: Theme) -> impl IntoElement {

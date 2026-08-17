@@ -13,6 +13,13 @@ enum Preview {
     Text(String),
 }
 
+/// 输入模式下的待处理操作。
+enum PendingOp {
+    Rename { path: String },
+    NewFile,
+    NewDir,
+}
+
 struct Root {
     client: Option<YaziClient>,
     cwd: String,
@@ -20,6 +27,9 @@ struct Root {
     hovered: Option<String>,
     preview: Preview,
     preview_path: Option<String>,
+    focus_handle: FocusHandle,
+    pending: Option<PendingOp>,
+    input: String,
 }
 
 impl Root {
@@ -31,6 +41,9 @@ impl Root {
             hovered: None,
             preview: Preview::Empty,
             preview_path: None,
+            focus_handle: cx.focus_handle(),
+            pending: None,
+            input: String::new(),
         };
         root.start_yazi(cx);
         root
@@ -199,12 +212,128 @@ impl Root {
         })
         .detach();
     }
+
+    // ---- 输入模式（重命名 / 新建） ----
+
+    fn start_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(h) = self.hovered.clone() else { return };
+        self.input = file_name_of(&h);
+        self.pending = Some(PendingOp::Rename { path: h });
+        cx.focus_self(window);
+        cx.notify();
+    }
+
+    fn start_new_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.input.clear();
+        self.pending = Some(PendingOp::NewFile);
+        cx.focus_self(window);
+        cx.notify();
+    }
+
+    fn start_new_dir(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.input.clear();
+        self.pending = Some(PendingOp::NewDir);
+        cx.focus_self(window);
+        cx.notify();
+    }
+
+    fn cancel_input(&mut self, cx: &mut Context<Self>) {
+        self.pending = None;
+        self.input.clear();
+        cx.notify();
+    }
+
+    fn confirm_input(&mut self, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending.take() else { return };
+        let name = self.input.trim().to_string();
+        self.input.clear();
+        cx.notify();
+
+        if name.is_empty() {
+            return;
+        }
+
+        let cwd = self.cwd.clone();
+        cx.spawn(async move |weak, cx| {
+            let cwd2 = cwd.clone();
+            let name2 = name.clone();
+            let ok = cx
+                .background_executor()
+                .spawn(async move {
+                    let target = std::path::Path::new(&cwd2).join(&name2);
+                    match &pending {
+                        PendingOp::Rename { path } => std::fs::rename(path, &target).is_ok(),
+                        PendingOp::NewFile => std::fs::write(&target, b"").is_ok(),
+                        PendingOp::NewDir => std::fs::create_dir_all(&target).is_ok(),
+                    }
+                })
+                .await;
+            if ok {
+                let cwd3 = cwd.clone();
+                weak.update(cx, |this, _cx| {
+                    this.send(&["cd", cwd3.as_str()]);
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    fn on_input_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        if self.pending.is_none() {
+            return;
+        }
+        let ks = &event.keystroke;
+        match ks.key.as_str() {
+            "enter" => self.confirm_input(cx),
+            "escape" => self.cancel_input(cx),
+            "backspace" => {
+                self.input.pop();
+                cx.notify();
+            }
+            "space" => {
+                self.input.push(' ');
+                cx.notify();
+            }
+            key if key.len() == 1 => {
+                if !ks.modifiers.control && !ks.modifiers.alt && !ks.modifiers.platform {
+                    let ch = ks.key_char.clone().unwrap_or_else(|| key.to_string());
+                    self.input.push_str(&ch);
+                    cx.notify();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn input_bar(&self) -> impl IntoElement {
+        let (label, text) = match &self.pending {
+            Some(PendingOp::Rename { .. }) => ("重命名", self.input.clone()),
+            Some(PendingOp::NewFile) => ("新建文件", self.input.clone()),
+            Some(PendingOp::NewDir) => ("新建文件夹", self.input.clone()),
+            None => return div(),
+        };
+        div()
+            .w_full()
+            .px_3()
+            .py_1()
+            .bg(rgb(0x45475a))
+            .text_sm()
+            .child(SharedString::from(format!("{}: {}_", label, text)))
+    }
+}
+
+impl Focusable for Root {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
 }
 
 impl Render for Root {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let cwd = SharedString::from(self.cwd.clone());
         let status = SharedString::from(format!("{} 项", self.files.len()));
+        let focus_handle = self.focus_handle.clone();
 
         div()
             .size_full()
@@ -212,6 +341,11 @@ impl Render for Root {
             .flex_col()
             .bg(rgb(0x1e1e2e))
             .text_color(rgb(0xcdd6f4))
+            .id("root")
+            .track_focus(&focus_handle)
+            .on_key_down(cx.listener(|this, event, _window, cx| {
+                this.on_input_key(event, cx);
+            }))
             .child(
                 div()
                     .w_full()
@@ -232,12 +366,16 @@ impl Render for Root {
                     .bg(rgb(0x181825))
                     .flex()
                     .gap_2()
-                    .child(action_button(cx, "btn-open", "打开", |this, cx| this.open_hovered(cx)))
-                    .child(action_button(cx, "btn-delete", "删除", |this, cx| this.delete_hovered(cx)))
-                    .child(action_button(cx, "btn-yank", "复制", |this, _cx| this.send(&["yank"])))
-                    .child(action_button(cx, "btn-cut", "剪切", |this, _cx| this.send(&["cut"])))
-                    .child(action_button(cx, "btn-paste", "粘贴", |this, _cx| this.send(&["paste"]))),
+                    .child(action_button(cx, "btn-open", "打开", |this, _w, cx| this.open_hovered(cx)))
+                    .child(action_button(cx, "btn-delete", "删除", |this, _w, cx| this.delete_hovered(cx)))
+                    .child(action_button(cx, "btn-rename", "重命名", |this, w, cx| this.start_rename(w, cx)))
+                    .child(action_button(cx, "btn-yank", "复制", |this, _w, _cx| this.send(&["yank"])))
+                    .child(action_button(cx, "btn-cut", "剪切", |this, _w, _cx| this.send(&["cut"])))
+                    .child(action_button(cx, "btn-paste", "粘贴", |this, _w, _cx| this.send(&["paste"])))
+                    .child(action_button(cx, "btn-newfile", "新建文件", |this, w, cx| this.start_new_file(w, cx)))
+                    .child(action_button(cx, "btn-newdir", "新建文件夹", |this, w, cx| this.start_new_dir(w, cx))),
             )
+            .child(self.input_bar())
             .child(
                 div()
                     .flex()
@@ -343,7 +481,7 @@ fn action_button(
     cx: &mut Context<Root>,
     id: &'static str,
     label: &'static str,
-    on_click: impl Fn(&mut Root, &mut Context<Root>) + 'static,
+    on_click: impl Fn(&mut Root, &mut Window, &mut Context<Root>) + 'static,
 ) -> impl IntoElement {
     div()
         .px_2()
@@ -354,8 +492,8 @@ fn action_button(
         .text_sm()
         .child(label)
         .id(id)
-        .on_click(cx.listener(move |this, _event, _window, cx| {
-            on_click(this, cx);
+        .on_click(cx.listener(move |this, _event, window, cx| {
+            on_click(this, window, cx);
         }))
 }
 

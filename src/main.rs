@@ -10,6 +10,7 @@ enum Preview {
     Loading,
     Dir,
     Binary { size: u64 },
+    Image { path: String },
     Text(String),
 }
 
@@ -120,6 +121,10 @@ impl Root {
     fn load_preview(&mut self, path: String, is_dir: bool, size: u64, cx: &mut Context<Self>) {
         if is_dir {
             self.preview = Preview::Dir;
+            return;
+        }
+        if is_image_file(&path) {
+            self.preview = Preview::Image { path };
             return;
         }
         if size > 1_000_000 {
@@ -446,18 +451,35 @@ impl Root {
             )
     }
 
-    fn preview_body(&self) -> impl IntoElement {
+    fn preview_body(&self) -> AnyElement {
         match &self.preview {
             Preview::Empty => div()
                 .text_sm()
                 .text_color(rgb(0x6c7086))
-                .child("悬停文件以预览"),
-            Preview::Loading => div().text_sm().text_color(rgb(0x6c7086)).child("加载中..."),
-            Preview::Dir => div().text_sm().child("目录"),
+                .child("悬停文件以预览")
+                .into_any_element(),
+            Preview::Loading => div()
+                .text_sm()
+                .text_color(rgb(0x6c7086))
+                .child("加载中...")
+                .into_any_element(),
+            Preview::Dir => div().text_sm().child("目录").into_any_element(),
             Preview::Binary { size } => div()
                 .text_sm()
-                .child(SharedString::from(format!("二进制文件 · {}", human_size(*size)))),
-            Preview::Text(t) => div().text_xs().child(SharedString::from(t.clone())),
+                .child(SharedString::from(format!(
+                    "二进制文件 · {}",
+                    human_size(*size)
+                )))
+                .into_any_element(),
+            Preview::Image { path } => img(std::path::PathBuf::from(path.clone()))
+                .w_full()
+                .h(px(400.0))
+                .object_fit(ObjectFit::Contain)
+                .into_any_element(),
+            Preview::Text(t) => div()
+                .text_xs()
+                .child(SharedString::from(t.clone()))
+                .into_any_element(),
         }
     }
 }
@@ -504,10 +526,11 @@ fn file_row(
     size: u64,
     hovered: bool,
 ) -> impl IntoElement {
+    let icon = file_icon(&name, is_dir);
     let display = SharedString::from(if is_dir {
-        format!("{}/", name)
+        format!("{} {}/", icon, name)
     } else {
-        name.clone()
+        format!("{} {}", icon, name)
     });
     let meta = SharedString::from(if is_dir {
         String::new()
@@ -559,6 +582,48 @@ fn file_name_of(url: &str) -> String {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| url.to_string())
+}
+
+fn is_image_file(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "png" | "jpg"
+                    | "jpeg"
+                    | "gif"
+                    | "webp"
+                    | "bmp"
+                    | "svg"
+                    | "ico"
+                    | "avif"
+                    | "tif"
+                    | "tiff"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// 根据文件类型返回一个 emoji 图标（用于文件列表）。
+fn file_icon(name: &str, is_dir: bool) -> &'static str {
+    if is_dir {
+        return "📁";
+    }
+    let ext = std::path::Path::new(name)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "ico" | "avif" => "🖼️",
+        "zip" | "tar" | "gz" | "rar" | "7z" | "xz" | "bz2" => "📦",
+        "exe" | "dll" | "msi" | "bin" => "⚙️",
+        "rs" | "py" | "js" | "ts" | "go" | "c" | "cpp" | "h" | "hpp" | "java" | "lua" | "toml"
+        | "json" | "yaml" | "yml" | "sh" | "md" | "html" | "css" | "rb" | "php" => "📝",
+        _ => "📄",
+    }
 }
 
 fn is_probably_text(bytes: &[u8]) -> bool {

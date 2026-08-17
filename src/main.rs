@@ -76,11 +76,46 @@ enum PendingOp {
     NewDir,
 }
 
-struct Root {
-    client: Option<YaziClient>,
+/// 一个标签页：独立的工作目录 + 文件列表 + 选中态。
+struct Tab {
     cwd: String,
     files: Vec<FileEntry>,
-    hovered: Option<String>,
+    /// 选中的文件名（单选时含 1 个，多选时多个）。
+    selected: Vec<String>,
+    /// Shift 范围选择的锚点（文件在 files 中的下标）。
+    anchor: Option<usize>,
+}
+
+impl Tab {
+    fn new(cwd: &str) -> Self {
+        Tab {
+            cwd: cwd.to_string(),
+            files: Vec::new(),
+            selected: Vec::new(),
+            anchor: None,
+        }
+    }
+}
+
+/// 文件复制/剪切剪贴板。
+struct Clipboard {
+    paths: Vec<String>,
+    cut: bool,
+}
+
+/// 右键上下文菜单状态。
+struct MenuState {
+    /// 右键命中的文件/目录名（None = 空白处）。
+    target: Option<String>,
+    position: Point<Pixels>,
+}
+
+struct Root {
+    client: Option<YaziClient>,
+    tabs: Vec<Tab>,
+    active: usize,
+    clipboard: Option<Clipboard>,
+    menu: Option<MenuState>,
     preview: Preview,
     preview_path: Option<String>,
     focus_handle: FocusHandle,
@@ -93,9 +128,10 @@ impl Root {
     fn new(cx: &mut Context<Self>) -> Self {
         let mut root = Self {
             client: None,
-            cwd: START_DIR.to_string(),
-            files: Vec::new(),
-            hovered: None,
+            tabs: vec![Tab::new(START_DIR)],
+            active: 0,
+            clipboard: None,
+            menu: None,
             preview: Preview::Empty,
             preview_path: None,
             focus_handle: cx.focus_handle(),
@@ -105,6 +141,14 @@ impl Root {
         };
         root.start_yazi(cx);
         root
+    }
+
+    fn cur(&self) -> &Tab {
+        &self.tabs[self.active]
+    }
+
+    fn cur_mut(&mut self) -> &mut Tab {
+        &mut self.tabs[self.active]
     }
 
     fn start_yazi(&mut self, cx: &mut Context<Self>) {
@@ -132,46 +176,121 @@ impl Root {
         match event {
             YaziEvent::Cd { url, .. } => {
                 if let Some(u) = url {
-                    self.cwd = u;
+                    self.cur_mut().cwd = u;
                 }
             }
-            YaziEvent::Hover { url, .. } => {
-                self.set_hovered(url, cx);
-            }
-            YaziEvent::GuiFiles { cwd, files, hovered } => {
-                self.cwd = cwd;
-                self.files = files;
-                self.set_hovered(hovered, cx);
+            YaziEvent::Hover { .. } => {}
+            YaziEvent::GuiFiles { cwd, files, .. } => {
+                self.cur_mut().cwd = cwd;
+                self.cur_mut().files = files;
             }
             _ => {}
         }
+        let _ = cx;
     }
 
-    fn set_hovered(&mut self, url: Option<String>, cx: &mut Context<Self>) {
-        if self.hovered == url {
+    // ---- 选中模型 ----
+
+    fn select_single(&mut self, name: &str) {
+        let tab = self.cur_mut();
+        tab.selected = vec![name.to_string()];
+        if let Some(ix) = tab.files.iter().position(|f| f.name == name) {
+            tab.anchor = Some(ix);
+        }
+    }
+
+    fn toggle_select(&mut self, name: &str) {
+        let tab = self.cur_mut();
+        if let Some(pos) = tab.selected.iter().position(|s| s == name) {
+            tab.selected.remove(pos);
+        } else {
+            tab.selected.push(name.to_string());
+        }
+        if let Some(ix) = tab.files.iter().position(|f| f.name == name) {
+            tab.anchor = Some(ix);
+        }
+    }
+
+    fn range_select(&mut self, name: &str) {
+        let tab = self.cur_mut();
+        let Some(end) = tab.files.iter().position(|f| f.name == name) else {
+            return;
+        };
+        let start = tab.anchor.unwrap_or(end);
+        let (lo, hi) = if start <= end { (start, end) } else { (end, start) };
+        let names: Vec<String> = tab.files[lo..=hi].iter().map(|f| f.name.clone()).collect();
+        tab.selected = names;
+    }
+
+    fn clear_selection(&mut self) {
+        self.cur_mut().selected.clear();
+    }
+
+    /// 单击/双击文件行的统一入口。
+    fn click_file(
+        &mut self,
+        name: &str,
+        is_dir: bool,
+        modifiers: Modifiers,
+        click_count: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if click_count >= 2 {
+            if is_dir {
+                self.enter(name);
+            } else {
+                self.open_path(name, cx);
+            }
             return;
         }
-        self.hovered = url.clone();
-        self.trigger_preview(url, cx);
+        if modifiers.control {
+            self.toggle_select(name);
+        } else if modifiers.shift {
+            self.range_select(name);
+        } else {
+            self.select_single(name);
+        }
+        self.update_preview_for_selection(cx);
+        cx.notify();
     }
 
-    fn trigger_preview(&mut self, hovered: Option<String>, cx: &mut Context<Self>) {
-        match &hovered {
-            Some(h) => {
-                let name = file_name_of(h);
-                let (is_dir, size) = self
+    /// 点击空白处：取消选中。
+    fn click_blank(&mut self, cx: &mut Context<Self>) {
+        self.clear_selection();
+        self.preview = Preview::Empty;
+        self.preview_path = None;
+        cx.notify();
+    }
+
+    /// 根据当前选中态刷新预览。
+    fn update_preview_for_selection(&mut self, cx: &mut Context<Self>) {
+        let (cwd, name, is_dir, size, count) = {
+            let tab = self.cur();
+            let count = tab.selected.len();
+            if count == 1 {
+                let name = tab.selected[0].clone();
+                let (is_dir, size) = tab
                     .files
                     .iter()
                     .find(|f| f.name == name)
                     .map(|f| (f.is_dir, f.size))
                     .unwrap_or((false, 0));
-                self.preview_path = Some(h.clone());
-                self.load_preview(h.clone(), is_dir, size, cx);
+                (tab.cwd.clone(), name, is_dir, size, 1usize)
+            } else {
+                (tab.cwd.clone(), String::new(), false, 0u64, count)
             }
-            None => {
-                self.preview = Preview::Empty;
-                self.preview_path = None;
-            }
+        };
+
+        if count == 1 {
+            let full = std::path::Path::new(&cwd)
+                .join(&name)
+                .to_string_lossy()
+                .into_owned();
+            self.preview_path = Some(full.clone());
+            self.load_preview(full, is_dir, size, cx);
+        } else {
+            self.preview = Preview::Empty;
+            self.preview_path = None;
         }
     }
 
@@ -193,7 +312,6 @@ impl Root {
 
         cx.spawn(async move |weak, cx| {
             let path2 = path.clone();
-            // 读取 + 截断 + 语法高亮，全部放后台线程（syntect 是 CPU 密集）。
             let result = cx
                 .background_executor()
                 .spawn(async move {
@@ -224,6 +342,8 @@ impl Root {
         .detach();
     }
 
+    // ---- 基础导航与操作 ----
+
     fn send(&self, action: &[&str]) {
         if let Some(client) = &self.client {
             let _ = client.send(action);
@@ -231,7 +351,7 @@ impl Root {
     }
 
     fn enter(&self, name: &str) {
-        let path = std::path::Path::new(&self.cwd).join(name);
+        let path = std::path::Path::new(&self.cur().cwd).join(name);
         self.send(&["cd", &path.to_string_lossy()]);
     }
 
@@ -239,45 +359,63 @@ impl Root {
         self.send(&["cd", ".."]);
     }
 
-    fn toggle_theme(&mut self, cx: &mut Context<Self>) {
-        self.theme = match self.theme.syntax_theme {
-            "InspiredGitHub" => Theme::dark(),
-            _ => Theme::light(),
-        };
-        cx.notify();
-    }
-
-    fn reveal(&self, name: &str) {
-        let path = std::path::Path::new(&self.cwd).join(name);
-        self.send(&["reveal", &path.to_string_lossy()]);
-    }
-
-    fn open_hovered(&self, cx: &mut Context<Self>) {
-        let Some(h) = self.hovered.clone() else { return };
-        let name = file_name_of(&h);
-        let is_dir = self.files.iter().any(|f| f.name == name && f.is_dir);
-        if is_dir {
-            self.enter(&name);
-            return;
-        }
+    fn open_path(&self, name: &str, cx: &mut Context<Self>) {
+        let path = std::path::Path::new(&self.cur().cwd)
+            .join(name)
+            .to_string_lossy()
+            .into_owned();
         cx.spawn(async move |_weak, cx| {
             cx.background_executor()
                 .spawn(async move {
-                    let _ = open::that(&h);
+                    let _ = open::that(&path);
                 })
                 .await;
         })
         .detach();
     }
 
-    fn delete_hovered(&self, cx: &mut Context<Self>) {
-        let Some(h) = self.hovered.clone() else { return };
-        let cwd = self.cwd.clone();
+    fn open_selected(&self, cx: &mut Context<Self>) {
+        let tab = self.cur();
+        let Some(name) = tab.selected.first().cloned() else {
+            return;
+        };
+        let is_dir = tab.files.iter().any(|f| f.name == name && f.is_dir);
+        if is_dir {
+            self.enter(&name);
+        } else {
+            self.open_path(&name, cx);
+        }
+    }
+
+    fn delete_selected(&self, cx: &mut Context<Self>) {
+        let cwd = self.cur().cwd.clone();
+        let paths: Vec<String> = self
+            .cur()
+            .selected
+            .iter()
+            .map(|n| {
+                std::path::Path::new(&cwd)
+                    .join(n)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
         cx.spawn(async move |weak, cx| {
-            let path2 = h.clone();
+            let paths2 = paths.clone();
             let ok = cx
                 .background_executor()
-                .spawn(async move { trash::delete(&path2).is_ok() })
+                .spawn(async move {
+                    let mut all = true;
+                    for p in &paths2 {
+                        if trash::delete(p).is_err() {
+                            all = false;
+                        }
+                    }
+                    all
+                })
                 .await;
             if ok {
                 let cwd2 = cwd.clone();
@@ -290,12 +428,27 @@ impl Root {
         .detach();
     }
 
+    fn toggle_theme(&mut self, cx: &mut Context<Self>) {
+        self.theme = match self.theme.syntax_theme {
+            "InspiredGitHub" => Theme::dark(),
+            _ => Theme::light(),
+        };
+        cx.notify();
+    }
+
     // ---- 输入模式（重命名 / 新建） ----
 
     fn start_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(h) = self.hovered.clone() else { return };
-        self.input = file_name_of(&h);
-        self.pending = Some(PendingOp::Rename { path: h });
+        let tab = self.cur();
+        let Some(name) = tab.selected.first().cloned() else {
+            return;
+        };
+        let path = std::path::Path::new(&tab.cwd)
+            .join(&name)
+            .to_string_lossy()
+            .into_owned();
+        self.input = name;
+        self.pending = Some(PendingOp::Rename { path });
         cx.focus_self(window);
         cx.notify();
     }
@@ -330,7 +483,7 @@ impl Root {
             return;
         }
 
-        let cwd = self.cwd.clone();
+        let cwd = self.cur().cwd.clone();
         cx.spawn(async move |weak, cx| {
             let cwd2 = cwd.clone();
             let name2 = name.clone();
@@ -357,9 +510,12 @@ impl Root {
     }
 
     fn on_input_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
-        if self.pending.is_none() {
-            return;
+        if self.pending.is_some() {
+            self.handle_typing(event, cx);
         }
+    }
+
+    fn handle_typing(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let ks = &event.keystroke;
         match ks.key.as_str() {
             "enter" => self.confirm_input(cx),
@@ -408,8 +564,8 @@ impl Focusable for Root {
 
 impl Render for Root {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let cwd = SharedString::from(self.cwd.clone());
-        let status = SharedString::from(format!("{} 项", self.files.len()));
+        let cwd = SharedString::from(self.cur().cwd.clone());
+        let status = SharedString::from(format!("{} 项", self.cur().files.len()));
         let focus_handle = self.focus_handle.clone();
         let theme = self.theme;
 
@@ -444,8 +600,8 @@ impl Render for Root {
                     .bg(theme.mantle)
                     .flex()
                     .gap_2()
-                    .child(action_button(cx, theme, "btn-open", "打开", |this, _w, cx| this.open_hovered(cx)))
-                    .child(action_button(cx, theme, "btn-delete", "删除", |this, _w, cx| this.delete_hovered(cx)))
+                    .child(action_button(cx, theme, "btn-open", "打开", |this, _w, cx| this.open_selected(cx)))
+                    .child(action_button(cx, theme, "btn-delete", "删除", |this, _w, cx| this.delete_selected(cx)))
                     .child(action_button(cx, theme, "btn-rename", "重命名", |this, w, cx| this.start_rename(w, cx)))
                     .child(action_button(cx, theme, "btn-yank", "复制", |this, _w, _cx| this.send(&["yank"])))
                     .child(action_button(cx, theme, "btn-cut", "剪切", |this, _w, _cx| this.send(&["cut"])))
@@ -479,26 +635,30 @@ impl Render for Root {
 
 impl Root {
     fn file_list(&self, cx: &Context<Self>) -> impl IntoElement {
+        let selected_names = &self.cur().selected;
         div()
             .flex_1()
             .id("file-list")
             .overflow_y_scroll()
-            .children(self.files.iter().map(|f| {
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.click_blank(cx);
+            }))
+            .children(self.cur().files.iter().map(|f| {
                 let name = f.name.clone();
                 let is_dir = f.is_dir;
                 let size = f.size;
-                let hovered = is_hovered(&self.hovered, &self.cwd, &name);
-                file_row(cx, self.theme, name, is_dir, size, hovered)
+                let selected = selected_names.iter().any(|s| s == &name);
+                file_row(cx, self.theme, name, is_dir, size, selected)
             }))
     }
 
     fn preview_pane(&self) -> impl IntoElement {
-        let title = SharedString::from(
-            self.hovered
-                .as_deref()
-                .map(file_name_of)
-                .unwrap_or_else(|| "预览".to_string()),
-        );
+        let tab = self.cur();
+        let title = SharedString::from(match tab.selected.len() {
+            0 => "预览".to_string(),
+            1 => tab.selected[0].clone(),
+            n => format!("已选 {} 项", n),
+        });
 
         div()
             .flex_1()
@@ -530,7 +690,7 @@ impl Root {
             Preview::Empty => div()
                 .text_sm()
                 .text_color(self.theme.muted)
-                .child("悬停文件以预览")
+                .child("单击选中文件以预览")
                 .into_any_element(),
             Preview::Loading => div()
                 .text_sm()
@@ -606,7 +766,7 @@ fn file_row(
     name: String,
     is_dir: bool,
     size: u64,
-    hovered: bool,
+    selected: bool,
 ) -> impl IntoElement {
     let icon = file_icon(&name, is_dir);
     let display = SharedString::from(if is_dir {
@@ -620,7 +780,7 @@ fn file_row(
         human_size(size)
     });
     let name_color = if is_dir { theme.blue } else { theme.text };
-    let hover_name = name.clone();
+    let click_name = name.clone();
 
     div()
         .w_full()
@@ -629,30 +789,17 @@ fn file_row(
         .flex()
         .justify_between()
         .gap_3()
-        .bg(if hovered { theme.surface0 } else { theme.base })
+        .bg(if selected { theme.surface0 } else { theme.base })
         .cursor_pointer()
         .id(SharedString::from(name.clone()))
-        .on_hover(cx.listener(move |this, hovered, _window, _cx| {
-            if *hovered {
-                this.reveal(&hover_name);
-            }
-        }))
-        .on_click(cx.listener(move |this, _event, _window, _cx| {
-            if is_dir {
-                this.enter(&name);
-            }
+        .on_click(cx.listener(move |this, event: &ClickEvent, _window, cx| {
+            let modifiers = event.modifiers();
+            let click_count = event.click_count();
+            this.click_file(&click_name, is_dir, modifiers, click_count, cx);
+            cx.stop_propagation();
         }))
         .child(div().text_sm().text_color(name_color).child(display))
         .child(div().text_xs().text_color(theme.muted).child(meta))
-}
-
-fn is_hovered(hovered: &Option<String>, cwd: &str, name: &str) -> bool {
-    if let Some(h) = hovered {
-        let full = std::path::Path::new(cwd).join(name);
-        h.as_str() == full.to_string_lossy().as_ref()
-    } else {
-        false
-    }
 }
 
 fn file_name_of(url: &str) -> String {

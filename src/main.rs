@@ -110,6 +110,19 @@ struct MenuState {
     position: Point<Pixels>,
 }
 
+/// 右键菜单项。
+#[derive(Clone, Copy)]
+enum MenuAction {
+    Open,
+    Rename,
+    Delete,
+    Copy,
+    Cut,
+    Paste,
+    NewFile,
+    NewDir,
+}
+
 struct Root {
     client: Option<YaziClient>,
     tabs: Vec<Tab>,
@@ -428,6 +441,124 @@ impl Root {
         .detach();
     }
 
+    fn selected_paths(&self) -> Vec<String> {
+        let cwd = self.cur().cwd.clone();
+        self.cur()
+            .selected
+            .iter()
+            .map(|n| {
+                std::path::Path::new(&cwd)
+                    .join(n)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect()
+    }
+
+    fn copy_selected(&mut self, cx: &mut Context<Self>) {
+        let paths = self.selected_paths();
+        if paths.is_empty() {
+            return;
+        }
+        self.clipboard = Some(Clipboard { paths, cut: false });
+        cx.notify();
+    }
+
+    fn cut_selected(&mut self, cx: &mut Context<Self>) {
+        let paths = self.selected_paths();
+        if paths.is_empty() {
+            return;
+        }
+        self.clipboard = Some(Clipboard { paths, cut: true });
+        cx.notify();
+    }
+
+    fn paste_clipboard(&self, cx: &mut Context<Self>) {
+        let Some(clip) = &self.clipboard else { return };
+        let dest = self.cur().cwd.clone();
+        let paths = clip.paths.clone();
+        let cut = clip.cut;
+        cx.spawn(async move |weak, cx| {
+            let dest2 = dest.clone();
+            let paths2 = paths.clone();
+            let ok = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut all = true;
+                    for src in &paths2 {
+                        let name = file_name_of(src);
+                        let dst = std::path::Path::new(&dest2).join(&name);
+                        let r = if cut {
+                            std::fs::rename(src, &dst)
+                        } else if std::path::Path::new(src).is_dir() {
+                            copy_dir_recursive(src, &dst)
+                        } else {
+                            std::fs::copy(src, &dst).map(|_| ())
+                        };
+                        if r.is_err() {
+                            all = false;
+                        }
+                    }
+                    all
+                })
+                .await;
+            if ok {
+                let dest3 = dest.clone();
+                weak.update(cx, |this, _cx| {
+                    if cut {
+                        this.clipboard = None;
+                    }
+                    this.send(&["cd", dest3.as_str()]);
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    fn open_menu(&mut self, target: Option<String>, position: Point<Pixels>, cx: &mut Context<Self>) {
+        // 右键命中的文件若不在选中集里，先单选它（Windows 习惯）。
+        if let Some(t) = &target {
+            if !self.cur().selected.iter().any(|s| s == t) {
+                self.select_single(t);
+            }
+        }
+        self.menu = Some(MenuState { target, position });
+        cx.notify();
+    }
+
+    fn close_menu(&mut self, cx: &mut Context<Self>) {
+        self.menu = None;
+        cx.notify();
+    }
+
+    fn exec_menu_action(&mut self, action: MenuAction, window: &mut Window, cx: &mut Context<Self>) {
+        let target = self.menu.as_ref().and_then(|m| m.target.clone());
+        match action {
+            MenuAction::Open => {
+                if let Some(name) = &target {
+                    let is_dir = self.cur().files.iter().any(|f| &f.name == name && f.is_dir);
+                    if is_dir {
+                        self.enter(name);
+                    } else {
+                        self.open_path(name, cx);
+                    }
+                } else {
+                    self.open_selected(cx);
+                }
+            }
+            MenuAction::Rename => self.start_rename(window, cx),
+            MenuAction::Delete => self.delete_selected(cx),
+            MenuAction::Copy => self.copy_selected(cx),
+            MenuAction::Cut => self.cut_selected(cx),
+            MenuAction::Paste => self.paste_clipboard(cx),
+            MenuAction::NewFile => self.start_new_file(window, cx),
+            MenuAction::NewDir => self.start_new_dir(window, cx),
+        }
+        self.menu = None;
+        cx.notify();
+    }
+
     fn toggle_theme(&mut self, cx: &mut Context<Self>) {
         self.theme = match self.theme.syntax_theme {
             "InspiredGitHub" => Theme::dark(),
@@ -554,6 +685,37 @@ impl Root {
             .text_sm()
             .child(SharedString::from(format!("{}: {}_", label, text)))
     }
+
+    fn context_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(menu) = &self.menu else { return div() };
+        let theme = self.theme;
+        let pos = menu.position;
+        let items = menu_items_for(&menu.target);
+
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _e, _w, cx| {
+                this.close_menu(cx);
+            }))
+            .child(
+                div()
+                    .absolute()
+                    .left(pos.x)
+                    .top(pos.y)
+                    .w(px(170.0))
+                    .py_1()
+                    .bg(theme.mantle)
+                    .border_1()
+                    .border_color(theme.surface0)
+                    .rounded_md()
+                    .children(items.iter().map(|(label, action)| {
+                        menu_item(cx, theme, label, *action)
+                    })),
+            )
+    }
 }
 
 impl Focusable for Root {
@@ -603,9 +765,9 @@ impl Render for Root {
                     .child(action_button(cx, theme, "btn-open", "打开", |this, _w, cx| this.open_selected(cx)))
                     .child(action_button(cx, theme, "btn-delete", "删除", |this, _w, cx| this.delete_selected(cx)))
                     .child(action_button(cx, theme, "btn-rename", "重命名", |this, w, cx| this.start_rename(w, cx)))
-                    .child(action_button(cx, theme, "btn-yank", "复制", |this, _w, _cx| this.send(&["yank"])))
-                    .child(action_button(cx, theme, "btn-cut", "剪切", |this, _w, _cx| this.send(&["cut"])))
-                    .child(action_button(cx, theme, "btn-paste", "粘贴", |this, _w, _cx| this.send(&["paste"])))
+                    .child(action_button(cx, theme, "btn-yank", "复制", |this, _w, cx| this.copy_selected(cx)))
+                    .child(action_button(cx, theme, "btn-cut", "剪切", |this, _w, cx| this.cut_selected(cx)))
+                    .child(action_button(cx, theme, "btn-paste", "粘贴", |this, _w, cx| this.paste_clipboard(cx)))
                     .child(action_button(cx, theme, "btn-newfile", "新建文件", |this, w, cx| this.start_new_file(w, cx)))
                     .child(action_button(cx, theme, "btn-newdir", "新建文件夹", |this, w, cx| this.start_new_dir(w, cx)))
                     .child(action_button(cx, theme, "btn-theme", theme.name, |this, _w, cx| this.toggle_theme(cx))),
@@ -630,6 +792,7 @@ impl Render for Root {
                     .text_color(theme.muted)
                     .child(status),
             )
+            .child(self.context_menu(cx))
     }
 }
 
@@ -642,6 +805,10 @@ impl Root {
             .overflow_y_scroll()
             .on_click(cx.listener(|this, _event, _window, cx| {
                 this.click_blank(cx);
+            }))
+            .on_mouse_down(MouseButton::Right, cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                this.open_menu(None, event.position, cx);
+                cx.stop_propagation();
             }))
             .children(self.cur().files.iter().map(|f| {
                 let name = f.name.clone();
@@ -760,6 +927,48 @@ fn action_button(
         }))
 }
 
+/// 根据右键目标生成菜单项。
+fn menu_items_for(target: &Option<String>) -> Vec<(&'static str, MenuAction)> {
+    match target {
+        Some(_) => vec![
+            ("打开", MenuAction::Open),
+            ("重命名", MenuAction::Rename),
+            ("删除", MenuAction::Delete),
+            ("复制", MenuAction::Copy),
+            ("剪切", MenuAction::Cut),
+            ("粘贴", MenuAction::Paste),
+            ("新建文件", MenuAction::NewFile),
+            ("新建文件夹", MenuAction::NewDir),
+        ],
+        None => vec![
+            ("粘贴", MenuAction::Paste),
+            ("新建文件", MenuAction::NewFile),
+            ("新建文件夹", MenuAction::NewDir),
+        ],
+    }
+}
+
+fn menu_item(
+    cx: &mut Context<Root>,
+    theme: Theme,
+    label: &'static str,
+    action: MenuAction,
+) -> AnyElement {
+    div()
+        .px_3()
+        .py_1()
+        .cursor_pointer()
+        .hover(|s| s.bg(theme.surface0))
+        .text_sm()
+        .child(label)
+        .id(label)
+        .on_click(cx.listener(move |this, _event, window, cx| {
+            this.exec_menu_action(action, window, cx);
+            cx.stop_propagation();
+        }))
+        .into_any_element()
+}
+
 fn file_row(
     cx: &Context<Root>,
     theme: Theme,
@@ -781,6 +990,7 @@ fn file_row(
     });
     let name_color = if is_dir { theme.blue } else { theme.text };
     let click_name = name.clone();
+    let right_name = name.clone();
 
     div()
         .w_full()
@@ -798,6 +1008,10 @@ fn file_row(
             this.click_file(&click_name, is_dir, modifiers, click_count, cx);
             cx.stop_propagation();
         }))
+        .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+            this.open_menu(Some(right_name.clone()), event.position, cx);
+            cx.stop_propagation();
+        }))
         .child(div().text_sm().text_color(name_color).child(display))
         .child(div().text_xs().text_color(theme.muted).child(meta))
 }
@@ -807,6 +1021,22 @@ fn file_name_of(url: &str) -> String {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| url.to_string())
+}
+
+/// 递归复制目录（普通文件 + 子目录，忽略符号链接/权限错误）。
+fn copy_dir_recursive(src: &str, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let path = entry.path();
+        let dest = dst.join(entry.file_name());
+        if path.is_dir() {
+            copy_dir_recursive(&path.to_string_lossy(), &dest)?;
+        } else {
+            std::fs::copy(&path, &dest)?;
+        }
+    }
+    Ok(())
 }
 
 fn is_image_file(path: &str) -> bool {

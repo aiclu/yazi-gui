@@ -15,9 +15,16 @@
 
 ## 关键约束与方案（已确认）
 - `--client-id` 与 `ya emit-to` 的 receiver **必须是纯数字**（u64）。
-- 启动：`yazi --client-id <ts> --local-events cd,hover,rename,trash,delete,move,bulk`；发指令：`ya emit-to <client_id> cd <path>`。
+- 启动：`yazi --client-id <ts> --local-events cd,hover,gui-files`（cwd 用 current_dir）；发指令：`ya emit-to <client_id> cd <path>`。
 - 事件格式：`kind,receiver,sender,{json}`；cd/hover 的 body 是 `{"tab":N,"url":"..."}`。
-- `--local-events` 只推增量事件，不推完整文件列表 → 写 yazi Lua 插件用 `ps.pub` 发布完整目录（路径/类型/大小/mtime/选中态）。
+- `--local-events` 只推增量事件 → 用 yazi Lua 插件 `ps.pub("gui-files", {...})` 发布完整目录。
+
+## yazi Lua 插件（已跑通，关键事实）
+- 插件目录：`<配置目录>/plugins/<名字>.yazi/main.lua`（**入口是 main.lua，不是 init.lua**）。
+- 插件不自动加载：配置根 `init.lua` 里 `require("gui-files"):setup()` 才触发插件 `setup`。
+- 用 `YAZI_CONFIG_HOME` 环境变量把配置目录指向项目 `assets/yazi/`，随 GUI 分发。
+- `ps.sub("cd"/"hover", cb)` 订阅内部事件（cb 在 sync 上下文可直接访问 `cx`）；`ps.pub(kind, data)` 会被 `--local-events=kind` 捕获到 stdout。
+- 文件列表：`cx.active.current.files`（`ipairs` 遍历）；文件 `.name`/`.cha`；cha 字段 `is_dir`/`is_hidden`/`is_link`/**`len`(字节大小)**/`mtime`(Unix 秒)/`atime`/`btime`。**注意是 `len` 不是 `length`。**
 
 ## GPUI 0.2.2 关键 API（与旧版不同，勿照抄老文档）
 ```rust

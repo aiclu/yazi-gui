@@ -2,8 +2,8 @@ use anyhow::Result;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{Receiver, channel};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 /// 一个文件条目（来自 yazi 插件发布的文件列表）。
 #[derive(Debug, Clone)]
@@ -97,7 +97,7 @@ pub struct YaziClient {
 
 impl YaziClient {
     /// 启动 yazi（隐藏、无 TTY），返回客户端句柄 + 事件接收端。
-    pub fn spawn(cwd: &Path) -> Result<(Self, Receiver<YaziEvent>)> {
+    pub fn spawn(cwd: &Path) -> Result<(Self, UnboundedReceiver<YaziEvent>)> {
         let client_id = format!(
             "{}",
             SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis()
@@ -121,7 +121,7 @@ impl YaziClient {
             .spawn()?;
 
         let stdout = child.stdout.take().expect("stdout must be piped");
-        let (tx, rx) = channel::<YaziEvent>();
+        let (tx, rx) = unbounded_channel::<YaziEvent>();
 
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {

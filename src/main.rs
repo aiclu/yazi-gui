@@ -26,10 +26,10 @@ impl Root {
 
     fn start_yazi(&mut self, cx: &mut Context<Self>) {
         match YaziClient::spawn(std::path::Path::new(START_DIR)) {
-            Ok((client, rx)) => {
+            Ok((client, mut rx)) => {
                 self.client = Some(client);
                 cx.spawn(async move |weak, cx| {
-                    while let Ok(event) = rx.recv() {
+                    while let Some(event) = rx.recv().await {
                         weak.update(cx, |this, cx| {
                             this.on_event(event);
                             cx.notify();

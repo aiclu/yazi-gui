@@ -1,0 +1,8 @@
+[package]
+name = "yazi-gui"
+version = "0.1.0"
+edition = "2024"
+description = "A native GUI for the yazi terminal file manager, powered by GPUI and yazi's DDS event stream."
+
+[dependencies]
+gpui = "0.2.2"

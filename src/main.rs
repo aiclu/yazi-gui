@@ -5,11 +5,21 @@ use yazi::{FileEntry, YaziClient, YaziEvent};
 
 const START_DIR: &str = "D:\\Projects\\gui_for_yazi";
 
+enum Preview {
+    Empty,
+    Loading,
+    Dir,
+    Binary { size: u64 },
+    Text(String),
+}
+
 struct Root {
     client: Option<YaziClient>,
     cwd: String,
     files: Vec<FileEntry>,
     hovered: Option<String>,
+    preview: Preview,
+    preview_path: Option<String>,
 }
 
 impl Root {
@@ -19,6 +29,8 @@ impl Root {
             cwd: START_DIR.to_string(),
             files: Vec::new(),
             hovered: None,
+            preview: Preview::Empty,
+            preview_path: None,
         };
         root.start_yazi(cx);
         root
@@ -31,7 +43,7 @@ impl Root {
                 cx.spawn(async move |weak, cx| {
                     while let Some(event) = rx.recv().await {
                         weak.update(cx, |this, cx| {
-                            this.on_event(event);
+                            this.on_event(event, cx);
                             cx.notify();
                         })
                         .ok();
@@ -45,7 +57,7 @@ impl Root {
         }
     }
 
-    fn on_event(&mut self, event: YaziEvent) {
+    fn on_event(&mut self, event: YaziEvent, cx: &mut Context<Self>) {
         match event {
             YaziEvent::Cd { url, .. } => {
                 if let Some(u) = url {
@@ -58,10 +70,67 @@ impl Root {
             YaziEvent::GuiFiles { cwd, files, hovered } => {
                 self.cwd = cwd;
                 self.files = files;
-                self.hovered = hovered;
+                if self.hovered != hovered {
+                    self.hovered = hovered.clone();
+                    self.trigger_preview(hovered, cx);
+                }
             }
             _ => {}
         }
+    }
+
+    fn trigger_preview(&mut self, hovered: Option<String>, cx: &mut Context<Self>) {
+        match &hovered {
+            Some(h) => {
+                let name = file_name_of(h);
+                let (is_dir, size) = self
+                    .files
+                    .iter()
+                    .find(|f| f.name == name)
+                    .map(|f| (f.is_dir, f.size))
+                    .unwrap_or((false, 0));
+                self.preview_path = Some(h.clone());
+                self.load_preview(h.clone(), is_dir, size, cx);
+            }
+            None => {
+                self.preview = Preview::Empty;
+                self.preview_path = None;
+            }
+        }
+    }
+
+    fn load_preview(&mut self, path: String, is_dir: bool, size: u64, cx: &mut Context<Self>) {
+        if is_dir {
+            self.preview = Preview::Dir;
+            return;
+        }
+        if size > 1_000_000 {
+            self.preview = Preview::Binary { size };
+            return;
+        }
+        self.preview = Preview::Loading;
+
+        cx.spawn(async move |weak, cx| {
+            let bytes = tokio::fs::read(&path).await.ok();
+            let text = bytes.and_then(|b| {
+                if is_probably_text(&b) {
+                    Some(String::from_utf8_lossy(&b).into_owned())
+                } else {
+                    None
+                }
+            });
+            weak.update(cx, |this, cx| {
+                if this.preview_path.as_deref() == Some(path.as_str()) {
+                    this.preview = match text {
+                        Some(t) => Preview::Text(truncate_preview(&t)),
+                        None => Preview::Binary { size },
+                    };
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn send(&self, action: &[&str]) {
@@ -91,7 +160,6 @@ impl Render for Root {
             .flex_col()
             .bg(rgb(0x1e1e2e))
             .text_color(rgb(0xcdd6f4))
-            // 顶部：路径 + 上级按钮
             .child(
                 div()
                     .w_full()
@@ -104,21 +172,14 @@ impl Render for Root {
                     .child(div().flex_1().text_sm().child(cwd))
                     .child(parent_button(cx)),
             )
-            // 文件列表
             .child(
                 div()
                     .flex_1()
-                    .id("file-list")
-                    .overflow_y_scroll()
-                    .children(self.files.iter().map(|f| {
-                        let name = f.name.clone();
-                        let is_dir = f.is_dir;
-                        let size = f.size;
-                        let hovered = is_hovered(&self.hovered, &self.cwd, &name);
-                        file_row(cx, name, is_dir, size, hovered)
-                    })),
+                    .flex_row()
+                    .child(self.file_list(cx))
+                    .child(div().w(px(1.0)).bg(rgb(0x313244)))
+                    .child(self.preview_pane()),
             )
-            // 底部状态栏
             .child(
                 div()
                     .w_full()
@@ -129,6 +190,70 @@ impl Render for Root {
                     .text_color(rgb(0x6c7086))
                     .child(status),
             )
+    }
+}
+
+impl Root {
+    fn file_list(&self, cx: &Context<Self>) -> impl IntoElement {
+        div()
+            .flex_1()
+            .id("file-list")
+            .overflow_y_scroll()
+            .children(self.files.iter().map(|f| {
+                let name = f.name.clone();
+                let is_dir = f.is_dir;
+                let size = f.size;
+                let hovered = is_hovered(&self.hovered, &self.cwd, &name);
+                file_row(cx, name, is_dir, size, hovered)
+            }))
+    }
+
+    fn preview_pane(&self) -> impl IntoElement {
+        let title = SharedString::from(
+            self.hovered
+                .as_deref()
+                .map(file_name_of)
+                .unwrap_or_else(|| "预览".to_string()),
+        );
+
+        div()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .bg(rgb(0x181825))
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .bg(rgb(0x11111b))
+                    .text_sm()
+                    .text_color(rgb(0x6c7086))
+                    .child(title),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .id("preview-content")
+                    .overflow_y_scroll()
+                    .px_3()
+                    .py_2()
+                    .child(self.preview_body()),
+            )
+    }
+
+    fn preview_body(&self) -> impl IntoElement {
+        match &self.preview {
+            Preview::Empty => div()
+                .text_sm()
+                .text_color(rgb(0x6c7086))
+                .child("悬停文件以预览"),
+            Preview::Loading => div().text_sm().text_color(rgb(0x6c7086)).child("加载中..."),
+            Preview::Dir => div().text_sm().child("目录"),
+            Preview::Binary { size } => div()
+                .text_sm()
+                .child(SharedString::from(format!("二进制文件 · {}", human_size(*size)))),
+            Preview::Text(t) => div().text_xs().child(SharedString::from(t.clone())),
+        }
     }
 }
 
@@ -198,6 +323,30 @@ fn is_hovered(hovered: &Option<String>, cwd: &str, name: &str) -> bool {
     }
 }
 
+fn file_name_of(url: &str) -> String {
+    std::path::Path::new(url)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| url.to_string())
+}
+
+fn is_probably_text(bytes: &[u8]) -> bool {
+    !bytes.iter().take(8000).any(|&b| b == 0)
+}
+
+fn truncate_preview(s: &str) -> String {
+    const MAX: usize = 64 * 1024;
+    if s.len() <= MAX {
+        s.to_string()
+    } else {
+        let mut end = MAX;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}\n\n... (预览已截断)", &s[..end])
+    }
+}
+
 fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     if bytes < 1024 {
@@ -216,7 +365,7 @@ fn main() {
     Application::new().run(|cx: &mut App| {
         cx.open_window(
             WindowOptions {
-                window_bounds: Some(WindowBounds::centered(size(px(900.0), px(600.0)), cx)),
+                window_bounds: Some(WindowBounds::centered(size(px(1000.0), px(650.0)), cx)),
                 titlebar: Some(TitlebarOptions {
                     title: Some("yazi-gui".into()),
                     ..Default::default()

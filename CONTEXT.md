@@ -16,6 +16,18 @@ _Avoid_: URL, location string
 The virtual top-level view that lists available drive roots before entering a directory.
 _Avoid_: desktop, root directory
 
+**Folder Tree**:
+A hierarchical navigation view of real folders below Computer View, drive roots, and their child folders.
+_Avoid_: file tree, global folder index
+
+**Favorite Folder**:
+A user-pinned real folder path, including a drive root or UNC folder, that can be opened from the Favorites Bar.
+_Avoid_: bookmark, shortcut
+
+**Favorites Bar**:
+The horizontal list of Favorite Folders below the Address Path, kept in the order the user added them.
+_Avoid_: recent folders, history
+
 **Sort State**:
 The field and direction used to order entries in an active tab's file list.
 _Avoid_: yazi sort mode, list preference
@@ -23,6 +35,14 @@ _Avoid_: yazi sort mode, list preference
 **Preview**:
 The content summary shown for the currently selected file or directory.
 _Avoid_: detail pane, inspector
+
+**Preview Panel**:
+The optional right-side surface that displays the Preview for the active selection.
+_Avoid_: inspector pane, details sidebar
+
+**File Search Field**:
+The always-visible file-page input that searches the active real directory by name or relative path.
+_Avoid_: address input
 
 **Refresh Operation**:
 The active-tab action that sends yazi's `cd <current directory>` action asynchronously, completes when yazi accepts the command, and applies the resulting `gui-files` snapshot when it arrives; in Computer View it rescans drive roots in the background.
@@ -41,7 +61,7 @@ The Windows notification-area icon that restores the window on left click and ex
 _Avoid_: background service, hidden process
 
 **Search Session**:
-The transient recursive search mode for the active real directory. Its query, generation, and results are discarded when the user navigates, switches tabs, or presses Escape.
+The recursive result state created by the File Search Field for the active real directory. Its query, generation, and results are cleared when the field is emptied or the user navigates or switches tabs.
 _Avoid_: global index, system-wide search
 
 **Search Result**:

@@ -1,6 +1,7 @@
 use gpui::*;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::ops::Range;
@@ -294,6 +295,152 @@ struct SearchState {
     scanning: bool,
 }
 
+#[derive(Clone)]
+struct FolderEntry {
+    path: String,
+    name: String,
+    is_link: bool,
+}
+
+#[derive(Clone)]
+enum FolderTreeRowKind {
+    Folder(FolderEntry),
+    Loading,
+    Error(String),
+}
+
+#[derive(Clone)]
+struct FolderTreeRow {
+    depth: usize,
+    kind: FolderTreeRowKind,
+}
+
+struct FolderTreeState {
+    expanded: HashMap<String, String>,
+    children: HashMap<String, Vec<FolderEntry>>,
+    loading: HashMap<String, u64>,
+    errors: HashMap<String, String>,
+    next_scan_id: u64,
+}
+
+impl Default for FolderTreeState {
+    fn default() -> Self {
+        Self {
+            expanded: HashMap::new(),
+            children: HashMap::new(),
+            loading: HashMap::new(),
+            errors: HashMap::new(),
+            next_scan_id: 0,
+        }
+    }
+}
+
+impl FolderTreeState {
+    fn is_expanded(&self, path: &str) -> bool {
+        self.expanded.contains_key(&tree_path_key(path))
+    }
+
+    fn toggle(&mut self, path: &str) -> bool {
+        let key = tree_path_key(path);
+        if self.expanded.remove(&key).is_some() {
+            false
+        } else {
+            self.expanded.insert(key, path.to_string());
+            true
+        }
+    }
+
+    fn expanded_paths(&self) -> Vec<String> {
+        self.expanded.values().cloned().collect()
+    }
+
+    fn invalidate(&mut self, path: &str) {
+        let key = tree_path_key(path);
+        self.children.remove(&key);
+        self.errors.remove(&key);
+    }
+
+    fn begin_scan(&mut self, path: &str, force: bool) -> Option<u64> {
+        let key = tree_path_key(path);
+        if !force && (self.children.contains_key(&key) || self.loading.contains_key(&key)) {
+            return None;
+        }
+        if force {
+            self.invalidate(path);
+        }
+        self.next_scan_id = self.next_scan_id.wrapping_add(1);
+        let scan_id = self.next_scan_id;
+        self.loading.insert(key, scan_id);
+        Some(scan_id)
+    }
+
+    fn finish_scan(&mut self, path: &str, scan_id: u64, result: io::Result<Vec<FolderEntry>>) {
+        let key = tree_path_key(path);
+        if self.loading.get(&key).copied() != Some(scan_id) {
+            return;
+        }
+        self.loading.remove(&key);
+        match result {
+            Ok(children) => {
+                self.errors.remove(&key);
+                self.children.insert(key, children);
+            }
+            Err(error) => {
+                self.children.remove(&key);
+                self.errors.insert(key, error.to_string());
+            }
+        }
+    }
+
+    fn visible_rows(&self, drive_roots: &[String]) -> Vec<FolderTreeRow> {
+        let mut rows = Vec::new();
+        for drive in drive_roots {
+            rows.push(FolderTreeRow {
+                depth: 0,
+                kind: FolderTreeRowKind::Folder(FolderEntry {
+                    path: drive.clone(),
+                    name: drive.clone(),
+                    is_link: false,
+                }),
+            });
+            if self.is_expanded(drive) {
+                self.append_children(&mut rows, drive, 1);
+            }
+        }
+        rows
+    }
+
+    fn append_children(&self, rows: &mut Vec<FolderTreeRow>, path: &str, depth: usize) {
+        let key = tree_path_key(path);
+        if let Some(error) = self.errors.get(&key) {
+            rows.push(FolderTreeRow {
+                depth,
+                kind: FolderTreeRowKind::Error(error.clone()),
+            });
+            return;
+        }
+        if self.loading.contains_key(&key) {
+            rows.push(FolderTreeRow {
+                depth,
+                kind: FolderTreeRowKind::Loading,
+            });
+            return;
+        }
+        let Some(children) = self.children.get(&key) else {
+            return;
+        };
+        for child in children {
+            rows.push(FolderTreeRow {
+                depth,
+                kind: FolderTreeRowKind::Folder(child.clone()),
+            });
+            if self.is_expanded(&child.path) && !child.is_link {
+                self.append_children(rows, &child.path, depth + 1);
+            }
+        }
+    }
+}
+
 impl Tab {
     fn new(cwd: &str) -> Self {
         Tab {
@@ -373,6 +520,7 @@ enum TransferUpdate {
 #[derive(Clone, Copy)]
 enum MenuAction {
     Open,
+    Favorite,
     Rename,
     Delete,
     Copy,
@@ -394,6 +542,8 @@ struct Root {
     menu: Option<MenuState>,
     preview: Preview,
     preview_path: Option<String>,
+    preview_collapsed: bool,
+    folder_tree: FolderTreeState,
     focus_handle: FocusHandle,
     input_blur_subscription: Option<Subscription>,
     pending: Option<PendingOp>,
@@ -445,6 +595,8 @@ impl Root {
             menu: None,
             preview: Preview::Empty,
             preview_path: None,
+            preview_collapsed: true,
+            folder_tree: FolderTreeState::default(),
             focus_handle: cx.focus_handle(),
             input_blur_subscription: None,
             pending: None,
@@ -493,6 +645,7 @@ impl Root {
     fn visible_files(&self) -> &[FileEntry] {
         self.search
             .as_ref()
+            .filter(|search| !search.query.is_empty())
             .map(|search| search.results.as_slice())
             .unwrap_or_else(|| self.cur().files.as_slice())
     }
@@ -924,6 +1077,10 @@ impl Root {
                         tab.refreshing = false;
                     }
                 }
+                if !this.cur().computer_view {
+                    let cwd = this.cur().cwd.clone();
+                    this.sync_folder_tree_to_path(&cwd, cx);
+                }
                 if mark_refresh && this.active == active {
                     this.set_status(format!(
                         "{}，{} {}",
@@ -938,6 +1095,136 @@ impl Root {
             .ok();
         })
         .detach();
+    }
+
+    fn start_folder_tree_scan(&mut self, path: String, force: bool, cx: &mut Context<Self>) {
+        let Some(scan_id) = self.folder_tree.begin_scan(&path, force) else {
+            return;
+        };
+        let scan_path = path.clone();
+        cx.spawn(async move |weak, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { scan_folder_children(Path::new(&scan_path)) })
+                .await;
+            weak.update(cx, |this, cx| {
+                this.folder_tree.finish_scan(&path, scan_id, result);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn toggle_folder_tree(&mut self, path: String, is_link: bool, cx: &mut Context<Self>) {
+        if is_link {
+            return;
+        }
+        let expanded = self.folder_tree.toggle(&path);
+        if expanded {
+            self.start_folder_tree_scan(path, false, cx);
+        }
+        cx.notify();
+    }
+
+    fn sync_folder_tree_to_path(&mut self, path: &str, cx: &mut Context<Self>) {
+        let ancestors = tree_ancestor_paths(path);
+        for ancestor in ancestors {
+            if !self.folder_tree.is_expanded(&ancestor) {
+                self.folder_tree.toggle(&ancestor);
+            }
+            self.start_folder_tree_scan(ancestor, false, cx);
+        }
+    }
+
+    fn refresh_folder_tree(&mut self, cx: &mut Context<Self>) {
+        let mut paths = self.folder_tree.expanded_paths();
+        if !self.cur().computer_view {
+            paths.push(self.cur().cwd.clone());
+        }
+        paths.sort_by_key(|path| tree_path_key(path));
+        paths.dedup_by(|a, b| tree_path_key(a) == tree_path_key(b));
+        for path in paths {
+            self.start_folder_tree_scan(path, true, cx);
+        }
+    }
+
+    fn navigate_to_directory(&mut self, target: String, cx: &mut Context<Self>) {
+        if !Path::new(&target).is_dir() {
+            self.set_status(format!("{}: {}", self.tr("路径不可用"), target));
+            cx.notify();
+            return;
+        }
+        self.clear_status();
+        match self.send_checked(&["cd", target.as_str()]) {
+            Ok(()) => {
+                self.cancel_input_state();
+                self.menu = None;
+                let tab = self.cur_mut();
+                tab.selected.clear();
+                tab.anchor = None;
+                tab.computer_view = false;
+                tab.refreshing = false;
+                self.preview = Preview::Empty;
+                self.preview_path = None;
+                self.sync_folder_tree_to_path(&target, cx);
+                self.set_status(format!("已跳转: {}", target));
+            }
+            Err(error) => self.set_status(format!("跳转失败: {}", error)),
+        }
+        cx.notify();
+    }
+
+    fn toggle_preview(&mut self, cx: &mut Context<Self>) {
+        self.preview_collapsed = !self.preview_collapsed;
+        if !self.preview_collapsed {
+            self.update_preview_for_selection(cx);
+        }
+        cx.notify();
+    }
+
+    fn is_favorite(&self, path: &str) -> bool {
+        let key = favorite_path_key(path);
+        self.settings
+            .favorites
+            .iter()
+            .any(|favorite| favorite_path_key(favorite) == key)
+    }
+
+    fn toggle_favorite_path(&mut self, path: String, cx: &mut Context<Self>) {
+        let path = normalize_favorite_path(&path);
+        let key = favorite_path_key(&path);
+        let previous = self.settings.favorites.clone();
+        if let Some(index) = self
+            .settings
+            .favorites
+            .iter()
+            .position(|favorite| favorite_path_key(favorite) == key)
+        {
+            self.settings.favorites.remove(index);
+            self.set_status(format!("{}: {}", self.tr("取消收藏"), path));
+        } else {
+            self.settings.favorites.push(path.clone());
+            self.set_status(format!("{}: {}", self.tr("收藏"), path));
+        }
+        if let Err(error) = settings::save(&self.settings) {
+            self.settings.favorites = previous;
+            self.set_status(format!("{}: {}", self.tr("保存失败"), error));
+        }
+        cx.notify();
+    }
+
+    fn toggle_current_favorite(&mut self, cx: &mut Context<Self>) {
+        if self.cur().computer_view {
+            self.set_status(self.tr("此电脑视图不可收藏"));
+            cx.notify();
+            return;
+        }
+        self.toggle_favorite_path(self.cur().cwd.clone(), cx);
+    }
+
+    fn open_favorite(&mut self, path: String, cx: &mut Context<Self>) {
+        self.navigate_to_directory(path, cx);
     }
 
     fn start_yazi(&mut self, cx: &mut Context<Self>) {
@@ -966,17 +1253,26 @@ impl Root {
         match event {
             YaziEvent::Cd { url, .. } => {
                 if !self.cur().computer_view {
+                    self.cancel_input_state();
                     if let Some(u) = url {
                         self.cur_mut().cwd = u;
                     }
                     self.cur_mut().computer_view = false;
                     self.cur_mut().refreshing = false;
+                    let cwd = self.cur().cwd.clone();
+                    self.sync_folder_tree_to_path(&cwd, cx);
                 }
             }
             YaziEvent::Hover { .. } => {}
             YaziEvent::GuiFiles { cwd, files, .. } => {
                 if !self.cur().computer_view {
-                    let search_active = self.search.is_some();
+                    if self.cur().cwd != cwd {
+                        self.cancel_input_state();
+                    }
+                    let search_active = self
+                        .search
+                        .as_ref()
+                        .is_some_and(|search| !search.query.is_empty());
                     let refreshed = {
                         let tab = self.cur_mut();
                         let refreshed = refresh_request_matches(tab.refreshing, &tab.cwd, &cwd);
@@ -1006,6 +1302,8 @@ impl Root {
                         ));
                     }
                     self.reconcile_preview();
+                    let current_cwd = self.cur().cwd.clone();
+                    self.sync_folder_tree_to_path(&current_cwd, cx);
                 }
             }
             _ => {}
@@ -1108,7 +1406,11 @@ impl Root {
             }
             tab.sort
         };
-        if let Some(search) = self.search.as_mut() {
+        if let Some(search) = self
+            .search
+            .as_mut()
+            .filter(|search| !search.query.is_empty())
+        {
             sort_files(&mut search.results, sort);
         } else {
             sort_files(&mut self.cur_mut().files, sort);
@@ -1186,10 +1488,11 @@ impl Root {
         };
 
         if count == 1 {
-            let full = std::path::Path::new(&cwd)
-                .join(&name)
-                .to_string_lossy()
-                .into_owned();
+            let full = if self.cur().computer_view {
+                PathBuf::from(&name).to_string_lossy().into_owned()
+            } else {
+                Path::new(&cwd).join(&name).to_string_lossy().into_owned()
+            };
             self.preview_path = Some(full.clone());
             self.load_preview(full, is_dir, size, cx);
         } else {
@@ -1277,6 +1580,7 @@ impl Root {
             return;
         }
         self.clear_status();
+        self.refresh_folder_tree(cx);
 
         if self.cur().computer_view {
             if self.cur().refreshing {
@@ -1774,7 +2078,10 @@ impl Root {
         match action {
             MenuAction::Open => {
                 if let Some(name) = &target {
-                    let is_dir = self.cur().files.iter().any(|f| &f.name == name && f.is_dir);
+                    let is_dir = self
+                        .visible_files()
+                        .iter()
+                        .any(|file| &file.name == name && file.is_dir);
                     if is_dir {
                         self.enter(name);
                     } else {
@@ -1782,6 +2089,19 @@ impl Root {
                     }
                 } else {
                     self.open_selected(cx);
+                }
+            }
+            MenuAction::Favorite => {
+                if let Some(name) = target {
+                    let path = if self.cur().computer_view {
+                        name
+                    } else {
+                        Path::new(&self.cur().cwd)
+                            .join(name)
+                            .to_string_lossy()
+                            .into_owned()
+                    };
+                    self.toggle_favorite_path(path, cx);
                 }
             }
             MenuAction::Rename => self.start_rename(window, cx),
@@ -1914,6 +2234,7 @@ impl Root {
         } else {
             let cwd = self.tabs[i].cwd.clone();
             self.send(&["cd", cwd.as_str()]);
+            self.sync_folder_tree_to_path(&cwd, cx);
         }
         cx.notify();
     }
@@ -1928,6 +2249,7 @@ impl Root {
         self.preview = Preview::Empty;
         self.preview_path = None;
         self.send(&["cd", cwd.as_str()]);
+        self.sync_folder_tree_to_path(&cwd, cx);
         cx.notify();
     }
 
@@ -1953,6 +2275,7 @@ impl Root {
         self.preview_path = None;
         let cwd = self.tabs[self.active].cwd.clone();
         self.send(&["cd", cwd.as_str()]);
+        self.sync_folder_tree_to_path(&cwd, cx);
         cx.notify();
     }
 
@@ -2030,6 +2353,9 @@ impl Root {
     }
 
     fn start_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.page != Page::Files {
+            return;
+        }
         self.cancel_input_state();
         if self.cur().computer_view {
             self.set_status(self.tr("搜索仅支持真实目录"));
@@ -2046,15 +2372,14 @@ impl Root {
             query: String::new(),
             results: Vec::new(),
             generation,
-            scanning: true,
+            scanning: false,
         });
         self.clear_selection();
         self.preview = Preview::Empty;
         self.preview_path = None;
         self.menu = None;
-        self.set_status(self.tr("搜索中..."));
+        self.clear_status();
         cx.focus_self(window);
-        self.start_search_scan(cx);
         cx.notify();
     }
 
@@ -2065,17 +2390,22 @@ impl Root {
         self.search_generation = self.search_generation.wrapping_add(1);
         let generation = self.search_generation;
         let query = self.input.clone();
+        let is_empty = query.is_empty();
         if let Some(search) = self.search.as_mut() {
             search.generation = generation;
             search.query = query;
             search.results.clear();
-            search.scanning = true;
+            search.scanning = !is_empty;
         }
         self.clear_selection();
         self.preview = Preview::Empty;
         self.preview_path = None;
-        self.set_status(self.tr("搜索中..."));
-        self.start_search_scan(cx);
+        if is_empty {
+            self.clear_status();
+        } else {
+            self.set_status(self.tr("搜索中..."));
+            self.start_search_scan(cx);
+        }
     }
 
     fn start_search_scan(&mut self, cx: &mut Context<Self>) {
@@ -2236,20 +2566,7 @@ impl Root {
             }
         };
 
-        match self.send_checked(&["cd", target.as_str()]) {
-            Ok(()) => {
-                self.cur_mut().selected.clear();
-                self.cur_mut().anchor = None;
-                self.cur_mut().computer_view = false;
-                self.cur_mut().refreshing = false;
-                self.preview = Preview::Empty;
-                self.preview_path = None;
-                self.cancel_input_state();
-                self.set_status(format!("已跳转: {}", target));
-            }
-            Err(error) => self.set_status(format!("跳转失败: {}", error)),
-        }
-        cx.notify();
+        self.navigate_to_directory(target, cx);
     }
 
     fn on_input_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -2328,7 +2645,16 @@ impl Root {
         cx: &mut Context<Self>,
         placeholder: impl Into<SharedString>,
     ) -> AnyElement {
-        div()
+        self.input_field_with_activation(cx, placeholder.into(), false)
+    }
+
+    fn input_field_with_activation(
+        &self,
+        cx: &mut Context<Self>,
+        placeholder: SharedString,
+        activate_search: bool,
+    ) -> AnyElement {
+        let mut field = div()
             .flex()
             .flex_1()
             .key_context("YaziInput")
@@ -2350,20 +2676,308 @@ impl Root {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::input_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::input_mouse_up))
             .on_mouse_move(cx.listener(Self::input_mouse_move))
-            .id("input-field")
-            .on_click(cx.listener(|_this, _event, _window, cx| {
+            .id("input-field");
+        if activate_search {
+            field = field.on_click(cx.listener(|this, _event, window, cx| {
+                if !matches!(this.pending, Some(PendingOp::Search)) {
+                    this.start_search(window, cx);
+                }
                 cx.stop_propagation();
-            }))
+            }));
+        } else {
+            field = field.on_click(cx.listener(|_this, _event, _window, cx| {
+                cx.stop_propagation();
+            }));
+        }
+        field
             .child(InputElement {
                 root: cx.entity(),
-                placeholder: placeholder.into(),
+                placeholder,
             })
             .into_any_element()
+    }
+
+    fn file_search_field(&self, cx: &mut Context<Root>) -> AnyElement {
+        let theme = self.theme;
+        let active = matches!(self.pending, None | Some(PendingOp::Search));
+        let mut field = div()
+            .w(px(240.0))
+            .h(px(28.0))
+            .px_2()
+            .bg(theme.surface0)
+            .rounded_sm()
+            .id("file-search-field");
+        if active {
+            field = field.child(self.input_field_with_activation(
+                cx,
+                self.tr("搜索文件...").into(),
+                true,
+            ));
+        } else {
+            field = field.child(
+                div()
+                    .flex_1()
+                    .text_sm()
+                    .text_color(theme.muted)
+                    .child(self.tr("搜索文件...")),
+            );
+        }
+        field.into_any_element()
     }
 
     fn input_bar(&self, cx: &mut Context<Self>) -> AnyElement {
         let _ = cx;
         div().into_any_element()
+    }
+
+    fn folder_tree_pane(&self, cx: &mut Context<Root>) -> AnyElement {
+        let theme = self.theme;
+        let computer_view = self.cur().computer_view;
+        let rows = self.folder_tree.visible_rows(&self.drive_roots);
+        let items = uniform_list(
+            "folder-tree-items",
+            rows.len(),
+            cx.processor(move |this, range: Range<usize>, _window, list_cx| {
+                range
+                    .filter_map(|index| rows.get(index).cloned())
+                    .map(|row| this.folder_tree_row(list_cx, row))
+                    .collect()
+            }),
+        )
+        .h_full();
+
+        div()
+            .w(px(240.0))
+            .h_full()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .bg(theme.mantle)
+            .id("folder-tree")
+            .child(
+                div()
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .bg(if computer_view {
+                        theme.surface0
+                    } else {
+                        theme.mantle
+                    })
+                    .cursor_pointer()
+                    .id("tree-computer")
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.show_computer_view(cx);
+                        cx.stop_propagation();
+                    }))
+                    .child(div().text_sm().child(format!("🖥 {}", self.tr("此电脑")))),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .h_full()
+                    .id("folder-tree-scroll")
+                    .overflow_y_scroll()
+                    .child(items),
+            )
+            .into_any_element()
+    }
+
+    fn folder_tree_row(&self, cx: &mut Context<Root>, row: FolderTreeRow) -> AnyElement {
+        let theme = self.theme;
+        let indent = px((row.depth as f32) * 16.0);
+        match row.kind {
+            FolderTreeRowKind::Loading => div()
+                .w_full()
+                .px_2()
+                .py_1()
+                .pl(indent)
+                .text_xs()
+                .text_color(theme.muted)
+                .child(self.tr("加载文件夹..."))
+                .into_any_element(),
+            FolderTreeRowKind::Error(error) => div()
+                .w_full()
+                .px_2()
+                .py_1()
+                .pl(indent)
+                .text_xs()
+                .text_color(theme.muted)
+                .child(SharedString::from(format!(
+                    "{} {}",
+                    self.tr("无法读取:"),
+                    error
+                )))
+                .into_any_element(),
+            FolderTreeRowKind::Folder(entry) => {
+                let is_link = entry.is_link;
+                let expanded = self.folder_tree.is_expanded(&entry.path);
+                let selected = !self.cur().computer_view
+                    && tree_path_key(&self.cur().cwd) == tree_path_key(&entry.path);
+                let favorite = self.is_favorite(&entry.path);
+                let arrow = if entry.is_link {
+                    " "
+                } else if expanded {
+                    "▾"
+                } else {
+                    "▸"
+                };
+                let toggle_path = entry.path.clone();
+                let navigate_path = entry.path.clone();
+                let favorite_path = entry.path.clone();
+                let row_id = SharedString::from(format!("tree-row-{}", tree_path_key(&entry.path)));
+                let toggle = div()
+                    .w(px(16.0))
+                    .text_sm()
+                    .text_color(theme.muted)
+                    .child(arrow);
+                let toggle = if is_link {
+                    toggle.into_any_element()
+                } else {
+                    toggle
+                        .cursor_pointer()
+                        .id(SharedString::from(format!(
+                            "tree-toggle-{}",
+                            tree_path_key(&entry.path)
+                        )))
+                        .on_click(cx.listener(move |this, _event, _window, cx| {
+                            this.toggle_folder_tree(toggle_path.clone(), false, cx);
+                            cx.stop_propagation();
+                        }))
+                        .into_any_element()
+                };
+                div()
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .pl(indent)
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .bg(if selected {
+                        theme.surface0
+                    } else {
+                        theme.mantle
+                    })
+                    .cursor_pointer()
+                    .id(row_id)
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.navigate_to_directory(navigate_path.clone(), cx);
+                        cx.stop_propagation();
+                    }))
+                    .child(toggle)
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_sm()
+                            .text_color(if selected { theme.blue } else { theme.text })
+                            .child(entry.name),
+                    )
+                    .child(
+                        div()
+                            .px_1()
+                            .text_xs()
+                            .text_color(if favorite { theme.blue } else { theme.muted })
+                            .cursor_pointer()
+                            .id(SharedString::from(format!(
+                                "tree-favorite-{}",
+                                tree_path_key(&favorite_path)
+                            )))
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                this.toggle_favorite_path(favorite_path.clone(), cx);
+                                cx.stop_propagation();
+                            }))
+                            .child(if favorite { "★" } else { "☆" }),
+                    )
+                    .into_any_element()
+            }
+        }
+    }
+
+    fn favorites_bar(&self, cx: &mut Context<Root>) -> AnyElement {
+        let theme = self.theme;
+        let mut bar = div()
+            .w_full()
+            .h(px(34.0))
+            .px_2()
+            .py_1()
+            .bg(theme.mantle)
+            .flex()
+            .items_center()
+            .gap_2()
+            .id("favorites-bar")
+            .overflow_x_scroll();
+        if self.settings.favorites.is_empty() {
+            return bar
+                .text_xs()
+                .text_color(theme.muted)
+                .child(self.tr("收藏夹为空"))
+                .into_any_element();
+        }
+        for (index, favorite) in self.settings.favorites.iter().enumerate() {
+            let path = favorite.clone();
+            let available = Path::new(&path).is_dir();
+            let label = favorite_display_name(&path);
+            let mut item = div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .px_2()
+                .py_1()
+                .bg(theme.surface0)
+                .rounded_sm()
+                .id(SharedString::from(format!("favorite-{}", index)));
+            if available {
+                let open_path = path.clone();
+                item = item.cursor_pointer().on_click(cx.listener(
+                    move |this, _event, _window, cx| {
+                        this.open_favorite(open_path.clone(), cx);
+                        cx.stop_propagation();
+                    },
+                ));
+            } else {
+                item = item
+                    .text_color(theme.muted)
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.set_status(format!("{}: {}", this.tr("路径不可用"), path));
+                        cx.stop_propagation();
+                    }));
+            }
+            let remove_path = favorite.clone();
+            bar = bar.child(
+                item.child(div().text_sm().child(label)).child(
+                    div()
+                        .px_1()
+                        .cursor_pointer()
+                        .id(SharedString::from(format!("favorite-remove-{}", index)))
+                        .on_click(cx.listener(move |this, _event, _window, cx| {
+                            this.toggle_favorite_path(remove_path.clone(), cx);
+                            cx.stop_propagation();
+                        }))
+                        .child("×"),
+                ),
+            );
+        }
+        bar.into_any_element()
+    }
+
+    fn content_row(&self, cx: &mut Context<Root>) -> AnyElement {
+        let theme = self.theme;
+        let mut row = div()
+            .flex()
+            .flex_1()
+            .h_full()
+            .flex_row()
+            .child(self.folder_tree_pane(cx))
+            .child(div().w(px(1.0)).bg(theme.surface0))
+            .child(self.file_list(cx));
+        if !self.preview_collapsed {
+            row = row
+                .child(div().w(px(1.0)).bg(theme.surface0))
+                .child(self.preview_pane());
+        }
+        row.into_any_element()
     }
 
     fn shortcut_setting_row(&self, cx: &mut Context<Root>, action: ShortcutAction) -> AnyElement {
@@ -2569,24 +3183,14 @@ impl Root {
     }
 
     fn address_bar(&self, cx: &mut Context<Self>, cwd: SharedString) -> AnyElement {
-        if matches!(
-            self.pending.as_ref(),
-            Some(PendingOp::GoToPath | PendingOp::Search)
-        ) {
+        if matches!(self.pending.as_ref(), Some(PendingOp::GoToPath)) {
             div()
                 .flex_1()
                 .px_2()
                 .py_1()
                 .bg(self.theme.surface0)
                 .rounded_sm()
-                .child(self.input_field(
-                    cx,
-                    if matches!(self.pending, Some(PendingOp::Search)) {
-                        self.tr("输入搜索...")
-                    } else {
-                        self.tr("输入路径...")
-                    },
-                ))
+                .child(self.input_field(cx, self.tr("输入路径...")))
                 .into_any_element()
         } else {
             div()
@@ -2630,7 +3234,32 @@ impl Root {
         };
         let theme = self.theme;
         let pos = menu.position;
-        let items = menu_items_for(&menu.target, self.cur().computer_view, self.language());
+        let target_is_dir = menu.target.as_ref().is_some_and(|target| {
+            self.cur().computer_view
+                || self
+                    .visible_files()
+                    .iter()
+                    .any(|file| file.name == *target && file.is_dir)
+        });
+        let target_path = menu.target.as_ref().map(|target| {
+            if self.cur().computer_view {
+                target.clone()
+            } else {
+                Path::new(&self.cur().cwd)
+                    .join(target)
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        });
+        let items = menu_items_for(
+            &menu.target,
+            self.cur().computer_view,
+            target_is_dir,
+            target_path
+                .as_deref()
+                .is_some_and(|path| self.is_favorite(path)),
+            self.language(),
+        );
 
         div()
             .absolute()
@@ -2971,14 +3600,112 @@ impl Render for Root {
         let status = SharedString::from(self.status.clone().unwrap_or_else(|| {
             if computer_view {
                 format!("{} {}", self.drive_roots.len(), self.tr("个磁盘"))
-            } else if let Some(search) = &self.search {
-                format!("{} {}", search.results.len(), self.tr("项"))
+            } else if self
+                .search
+                .as_ref()
+                .is_some_and(|search| !search.query.is_empty())
+            {
+                let count = self
+                    .search
+                    .as_ref()
+                    .map_or(0, |search| search.results.len());
+                format!("{} {}", count, self.tr("项"))
             } else {
                 format!("{} {}", self.cur().files.len(), self.tr("项"))
             }
         }));
         let focus_handle = self.focus_handle.clone();
         let theme = self.theme;
+        let favorite_label = if !computer_view && self.is_favorite(&self.cur().cwd) {
+            "★"
+        } else {
+            "☆"
+        };
+        let mut action_row = div()
+            .w_full()
+            .px_3()
+            .py_1()
+            .bg(theme.mantle)
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(action_button(
+                cx,
+                theme,
+                "btn-open",
+                self.tr("打开"),
+                |this, _w, cx| this.open_selected(cx),
+            ))
+            .child(action_button(
+                cx,
+                theme,
+                "btn-delete",
+                self.tr("删除"),
+                |this, _w, cx| this.delete_selected(cx),
+            ))
+            .child(action_button(
+                cx,
+                theme,
+                "btn-rename",
+                self.tr("重命名"),
+                |this, w, cx| this.start_rename(w, cx),
+            ))
+            .child(action_button(
+                cx,
+                theme,
+                "btn-yank",
+                self.tr("复制"),
+                |this, _w, cx| this.copy_selected(cx),
+            ))
+            .child(action_button(
+                cx,
+                theme,
+                "btn-cut",
+                self.tr("剪切"),
+                |this, _w, cx| this.cut_selected(cx),
+            ))
+            .child(action_button(
+                cx,
+                theme,
+                "btn-paste",
+                self.tr("粘贴"),
+                |this, _w, cx| this.paste_clipboard(cx),
+            ))
+            .child(action_button(
+                cx,
+                theme,
+                "btn-newfile",
+                self.tr("新建文件"),
+                |this, w, cx| this.start_new_file(w, cx),
+            ))
+            .child(action_button(
+                cx,
+                theme,
+                "btn-newdir",
+                self.tr("新建文件夹"),
+                |this, w, cx| this.start_new_dir(w, cx),
+            ))
+            .child(action_button(
+                cx,
+                theme,
+                "btn-preview-toggle",
+                self.tr(if self.preview_collapsed {
+                    "展开预览"
+                } else {
+                    "折叠预览"
+                }),
+                |this, _w, cx| this.toggle_preview(cx),
+            ));
+        action_row = action_row
+            .child(div().flex_1())
+            .child(self.file_search_field(cx))
+            .child(action_button(
+                cx,
+                theme,
+                "btn-settings",
+                self.tr("设置"),
+                |this, _w, cx| this.show_settings(cx),
+            ));
 
         div()
             .size_full()
@@ -3002,100 +3729,21 @@ impl Render for Root {
                     .items_center()
                     .gap_3()
                     .child(self.address_bar(cx, cwd))
+                    .child(action_button(
+                        cx,
+                        theme,
+                        "btn-favorite-current",
+                        favorite_label,
+                        |this, _w, cx| this.toggle_current_favorite(cx),
+                    ))
                     .child(refresh_button(cx, theme, self.language()))
                     .child(parent_button(cx, theme, self.language()))
                     .child(computer_button(cx, theme, self.language())),
             )
-            .child(
-                div()
-                    .w_full()
-                    .px_3()
-                    .py_1()
-                    .bg(theme.mantle)
-                    .flex()
-                    .gap_2()
-                    .child(action_button(
-                        cx,
-                        theme,
-                        "btn-open",
-                        self.tr("打开"),
-                        |this, _w, cx| this.open_selected(cx),
-                    ))
-                    .child(action_button(
-                        cx,
-                        theme,
-                        "btn-search",
-                        self.tr("搜索"),
-                        |this, w, cx| this.start_search(w, cx),
-                    ))
-                    .child(action_button(
-                        cx,
-                        theme,
-                        "btn-delete",
-                        self.tr("删除"),
-                        |this, _w, cx| this.delete_selected(cx),
-                    ))
-                    .child(action_button(
-                        cx,
-                        theme,
-                        "btn-rename",
-                        self.tr("重命名"),
-                        |this, w, cx| this.start_rename(w, cx),
-                    ))
-                    .child(action_button(
-                        cx,
-                        theme,
-                        "btn-yank",
-                        self.tr("复制"),
-                        |this, _w, cx| this.copy_selected(cx),
-                    ))
-                    .child(action_button(
-                        cx,
-                        theme,
-                        "btn-cut",
-                        self.tr("剪切"),
-                        |this, _w, cx| this.cut_selected(cx),
-                    ))
-                    .child(action_button(
-                        cx,
-                        theme,
-                        "btn-paste",
-                        self.tr("粘贴"),
-                        |this, _w, cx| this.paste_clipboard(cx),
-                    ))
-                    .child(action_button(
-                        cx,
-                        theme,
-                        "btn-newfile",
-                        self.tr("新建文件"),
-                        |this, w, cx| this.start_new_file(w, cx),
-                    ))
-                    .child(action_button(
-                        cx,
-                        theme,
-                        "btn-newdir",
-                        self.tr("新建文件夹"),
-                        |this, w, cx| this.start_new_dir(w, cx),
-                    ))
-                    .child(action_button(
-                        cx,
-                        theme,
-                        "btn-settings",
-                        self.tr("设置"),
-                        |this, _w, cx| this.show_settings(cx),
-                    )),
-            )
+            .child(self.favorites_bar(cx))
+            .child(action_row)
             .child(self.input_bar(cx))
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .h_full()
-                    .flex_row()
-                    .child(self.file_list(cx))
-                    .child(div().w(px(1.0)).bg(theme.surface0))
-                    .child(self.preview_pane()),
-            )
+            .child(self.content_row(cx))
             .child(self.status_bar(cx, theme, status))
             .child(self.context_menu(cx))
             .child(self.delete_confirmation(cx))
@@ -3244,7 +3892,10 @@ impl Root {
     fn file_list(&self, cx: &Context<Root>) -> impl IntoElement {
         let theme = self.theme;
         let computer_view = self.cur().computer_view;
-        let search_active = self.search.is_some();
+        let search_active = self
+            .search
+            .as_ref()
+            .is_some_and(|search| !search.query.is_empty());
 
         // computer_view 时显示磁盘盘符；否则显示当前目录文件。
         let mut entries: Vec<(String, bool, u64, f64, bool)> = if computer_view {
@@ -3405,7 +4056,8 @@ impl Root {
         });
 
         div()
-            .flex_1()
+            .w(px(320.0))
+            .flex_shrink_0()
             .h_full()
             .flex()
             .flex_col()
@@ -3421,7 +4073,8 @@ impl Root {
             )
             .child(
                 div()
-                    .flex_1()
+                    .w(px(320.0))
+                    .flex_shrink_0()
                     .h_full()
                     .id("preview-content")
                     .overflow_y_scroll()
@@ -3683,28 +4336,67 @@ fn settings_line(
 fn menu_items_for(
     target: &Option<String>,
     computer_view: bool,
+    target_is_dir: bool,
+    is_favorite: bool,
     language: Language,
 ) -> Vec<(String, MenuAction)> {
     if computer_view {
-        return vec![(settings::translate(language, "打开"), MenuAction::Open)];
+        return target
+            .as_ref()
+            .map(|_| {
+                vec![
+                    (settings::translate(language, "打开"), MenuAction::Open),
+                    (
+                        settings::translate(
+                            language,
+                            if is_favorite {
+                                "取消收藏"
+                            } else {
+                                "收藏"
+                            },
+                        ),
+                        MenuAction::Favorite,
+                    ),
+                ]
+            })
+            .unwrap_or_default();
     }
     match target {
-        Some(_) => vec![
-            (settings::translate(language, "打开"), MenuAction::Open),
-            (settings::translate(language, "重命名"), MenuAction::Rename),
-            (settings::translate(language, "删除"), MenuAction::Delete),
-            (settings::translate(language, "复制"), MenuAction::Copy),
-            (settings::translate(language, "剪切"), MenuAction::Cut),
-            (settings::translate(language, "粘贴"), MenuAction::Paste),
-            (
-                settings::translate(language, "新建文件"),
-                MenuAction::NewFile,
-            ),
-            (
-                settings::translate(language, "新建文件夹"),
-                MenuAction::NewDir,
-            ),
-        ],
+        Some(_) => {
+            let mut items = vec![
+                (settings::translate(language, "打开"), MenuAction::Open),
+                (settings::translate(language, "重命名"), MenuAction::Rename),
+                (settings::translate(language, "删除"), MenuAction::Delete),
+                (settings::translate(language, "复制"), MenuAction::Copy),
+                (settings::translate(language, "剪切"), MenuAction::Cut),
+                (settings::translate(language, "粘贴"), MenuAction::Paste),
+                (
+                    settings::translate(language, "新建文件"),
+                    MenuAction::NewFile,
+                ),
+                (
+                    settings::translate(language, "新建文件夹"),
+                    MenuAction::NewDir,
+                ),
+            ];
+            if target_is_dir {
+                items.insert(
+                    1,
+                    (
+                        settings::translate(
+                            language,
+                            if is_favorite {
+                                "取消收藏"
+                            } else {
+                                "收藏"
+                            },
+                        ),
+                        MenuAction::Favorite,
+                    ),
+                );
+            }
+            items
+        }
         None => vec![
             (settings::translate(language, "粘贴"), MenuAction::Paste),
             (
@@ -3880,6 +4572,117 @@ fn file_name_of(url: &str) -> String {
         .unwrap_or_else(|| url.to_string())
 }
 
+fn favorite_display_name(path: &str) -> String {
+    if is_drive_root(path) {
+        return path.to_string();
+    }
+    Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| path.to_string())
+}
+
+fn tree_path_key(path: &str) -> String {
+    let mut normalized = path.replace('/', "\\");
+    while normalized.len() > 3 && normalized.ends_with('\\') {
+        normalized.pop();
+    }
+    normalized.to_ascii_lowercase()
+}
+
+fn tree_ancestor_paths(path: &str) -> Vec<String> {
+    let mut current = PathBuf::from(path);
+    let mut ancestors = Vec::new();
+    loop {
+        let text = current.to_string_lossy().into_owned();
+        if text.is_empty() {
+            return Vec::new();
+        }
+        ancestors.push(text.clone());
+        if is_drive_root(&text) {
+            break;
+        }
+        let Some(parent) = current.parent() else {
+            return Vec::new();
+        };
+        if parent == current {
+            return Vec::new();
+        }
+        current = parent.to_path_buf();
+    }
+    ancestors.reverse();
+    if ancestors
+        .first()
+        .is_some_and(|ancestor| is_drive_root(ancestor))
+    {
+        ancestors
+    } else {
+        Vec::new()
+    }
+}
+
+fn scan_folder_children(root: &Path) -> io::Result<Vec<FolderEntry>> {
+    let mut children = Vec::new();
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        let is_link = is_link_metadata(&metadata);
+        let is_dir = if is_link {
+            fs::metadata(&path)
+                .map(|target| target.is_dir())
+                .unwrap_or(false)
+        } else {
+            metadata.is_dir()
+        };
+        if !is_dir {
+            continue;
+        }
+        children.push(FolderEntry {
+            path: path.to_string_lossy().into_owned(),
+            name: entry.file_name().to_string_lossy().into_owned(),
+            is_link,
+        });
+    }
+    children.sort_by(|left, right| {
+        left.name
+            .to_lowercase()
+            .cmp(&right.name.to_lowercase())
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(children)
+}
+
+fn is_link_metadata(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_type().is_symlink()
+            || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
+}
+
+fn normalize_favorite_path(path: &str) -> String {
+    let mut normalized = path.trim().replace('/', "\\");
+    let preserve_drive_root = is_drive_root(&normalized);
+    if !preserve_drive_root {
+        while normalized.ends_with('\\') {
+            normalized.pop();
+        }
+    }
+    normalized
+}
+
+fn favorite_path_key(path: &str) -> String {
+    normalize_favorite_path(path).to_ascii_lowercase()
+}
+
 fn normalize_single_path(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -4048,7 +4851,7 @@ fn search_directory(root: &Path, query: &str) -> io::Result<Vec<FileEntry>> {
             let entry = entry?;
             let path = entry.path();
             let metadata = fs::symlink_metadata(&path)?;
-            let is_symlink = metadata.file_type().is_symlink();
+            let is_symlink = is_link_metadata(&metadata);
             let is_dir = if is_symlink {
                 fs::metadata(&path)
                     .map(|target| target.is_dir())
@@ -4716,9 +5519,10 @@ fn main() {
 mod tests {
     use super::{
         DeleteSummary, FileEntry, SortDirection, SortField, SortState, TransferOutcome,
-        copy_paths_with_progress, delete_status, format_mtime, is_unc_path, keystroke_to_shortcut,
-        normalize_shortcut, normalize_single_path, permanent_delete, reconcile_selection,
-        refresh_request_matches, resolve_address_path, search_directory, sort_files,
+        copy_paths_with_progress, delete_status, favorite_path_key, format_mtime, is_unc_path,
+        keystroke_to_shortcut, normalize_favorite_path, normalize_shortcut, normalize_single_path,
+        permanent_delete, reconcile_selection, refresh_request_matches, resolve_address_path,
+        scan_folder_children, search_directory, sort_files, tree_ancestor_paths, tree_path_key,
     };
     use std::fs;
     use std::sync::atomic::AtomicBool;
@@ -4761,6 +5565,54 @@ mod tests {
             resolve_address_path(r"D:\Projects\gui_for_yazi", r"C:\Temp").unwrap(),
             r"C:\Temp"
         );
+    }
+
+    #[test]
+    fn normalizes_favorite_paths_and_deduplicates_case_insensitively() {
+        assert_eq!(normalize_favorite_path(r"D:\Projects\"), r"D:\Projects");
+        assert_eq!(normalize_favorite_path(r"D:\"), r"D:\");
+        assert_eq!(
+            favorite_path_key(r"\\SERVER\Share\Folder\"),
+            favorite_path_key(r"\\server\share\folder")
+        );
+    }
+
+    #[test]
+    fn expands_drive_ancestors_for_the_folder_tree() {
+        assert_eq!(
+            tree_ancestor_paths(r"D:\Projects\gui_for_yazi"),
+            vec![
+                r"D:\".to_string(),
+                r"D:\Projects".to_string(),
+                r"D:\Projects\gui_for_yazi".to_string()
+            ]
+        );
+        assert!(tree_ancestor_paths(r"\\server\share\folder").is_empty());
+        assert_eq!(tree_path_key(r"D:/Projects/"), r"d:\projects");
+    }
+
+    #[test]
+    fn folder_tree_scan_returns_only_direct_child_folders() {
+        let root = std::env::temp_dir().join(format!(
+            "yazi-gui-tree-test-{}-{}",
+            std::process::id(),
+            super::TEMP_SEQUENCE.fetch_add(1, super::AtomicOrdering::Relaxed)
+        ));
+        fs::create_dir_all(root.join("z-folder")).unwrap();
+        fs::create_dir_all(root.join("A-folder")).unwrap();
+        fs::create_dir_all(root.join("z-folder").join("nested")).unwrap();
+        fs::write(root.join("file.txt"), b"not a folder").unwrap();
+
+        let children = scan_folder_children(&root).unwrap();
+        assert_eq!(
+            children
+                .iter()
+                .map(|child| child.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["A-folder", "z-folder"]
+        );
+        assert!(children.iter().all(|child| !child.is_link));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

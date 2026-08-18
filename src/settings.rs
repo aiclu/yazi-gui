@@ -97,6 +97,7 @@ pub struct AppSettings {
     pub theme: ThemeMode,
     pub language: Language,
     pub shortcuts: ShortcutSettings,
+    pub favorites: Vec<String>,
     /// Deliberately false: first launch must not alter Windows startup behavior.
     pub autostart: bool,
 }
@@ -107,6 +108,7 @@ impl Default for AppSettings {
             theme: ThemeMode::Dark,
             language: Language::System,
             shortcuts: ShortcutSettings::default(),
+            favorites: Vec::new(),
             autostart: false,
         }
     }
@@ -260,6 +262,14 @@ pub fn translate(language: Language, text: &str) -> String {
         "新建标签页" => "New tab".to_string(),
         "关闭标签页" => "Close tab".to_string(),
         "设置" => "Settings".to_string(),
+        "收藏" => "Favorite".to_string(),
+        "取消收藏" => "Remove favorite".to_string(),
+        "收藏夹为空" => "No favorite folders".to_string(),
+        "路径不可用" => "Path unavailable".to_string(),
+        "此电脑视图不可收藏" => "Computer View cannot be favorited".to_string(),
+        "文件夹树" => "Folder tree".to_string(),
+        "展开预览" => "Show preview".to_string(),
+        "折叠预览" => "Hide preview".to_string(),
         "名称" => "Name".to_string(),
         "修改时间" => "Modified".to_string(),
         "大小" => "Size".to_string(),
@@ -302,6 +312,11 @@ pub fn translate(language: Language, text: &str) -> String {
         "按下快捷键..." => "Press a shortcut...".to_string(),
         "清除快捷键" => "Clear shortcut".to_string(),
         "输入搜索..." => "Search...".to_string(),
+        "搜索文件..." => "Search files...".to_string(),
+        "加载文件夹..." => "Loading folder...".to_string(),
+        "无法读取: " => "Cannot read: ".to_string(),
+        "展开" => "Expand".to_string(),
+        "收起" => "Collapse".to_string(),
         "搜索中..." => "Searching...".to_string(),
         "搜索失败" => "Search failed".to_string(),
         "搜索仅支持真实目录" => "Search is only available in a real directory".to_string(),
@@ -371,6 +386,7 @@ mod tests {
         let json = serde_json::to_string(&settings).unwrap();
         let decoded: AppSettings = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, settings);
+        assert!(decoded.favorites.is_empty());
     }
 
     #[test]
@@ -393,6 +409,13 @@ mod tests {
             "autostart":false
         }"#;
         assert!(serde_json::from_str::<AppSettings>(json).is_err());
+    }
+
+    #[test]
+    fn settings_without_favorites_are_rejected() {
+        let mut value = serde_json::to_value(AppSettings::default()).unwrap();
+        value.as_object_mut().unwrap().remove("favorites");
+        assert!(serde_json::from_value::<AppSettings>(value).is_err());
     }
 
     #[test]

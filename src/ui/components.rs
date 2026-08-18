@@ -15,8 +15,11 @@ pub(crate) fn tab_button(
     i: usize,
     name: SharedString,
     active: bool,
+    width: f32,
 ) -> AnyElement {
     div()
+        .w(px(width))
+        .flex_shrink_0()
         .px_2()
         .py_1()
         .bg(if active { theme.mantle } else { theme.surface0 })
@@ -39,9 +42,20 @@ pub(crate) fn tab_button(
                 cx.stop_propagation();
             }),
         )
-        .child(div().text_sm().child(name))
         .child(
             div()
+                .flex_1()
+                .min_w(px(0.0))
+                .text_sm()
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .text_ellipsis()
+                .child(name),
+        )
+        .child(
+            div()
+                .w(px(18.0))
+                .flex_shrink_0()
                 .px_1()
                 .cursor_pointer()
                 .child("×")
@@ -52,6 +66,52 @@ pub(crate) fn tab_button(
                 })),
         )
         .into_any_element()
+}
+
+pub(crate) fn tab_scroll_button(
+    cx: &mut Context<Root>,
+    theme: Theme,
+    id: &'static str,
+    icon: &'static str,
+    tooltip: impl Into<SharedString>,
+    enabled: bool,
+    on_click: impl Fn(&mut Root, &mut Window, &mut Context<Root>) + 'static,
+) -> impl IntoElement {
+    let tooltip = tooltip.into();
+    div()
+        .w(px(32.0))
+        .h(px(30.0))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(if enabled { theme.surface0 } else { theme.crust })
+        .border_1()
+        .border_color(theme.border)
+        .rounded_sm()
+        .text_base()
+        .text_color(if enabled { theme.text } else { theme.muted })
+        .cursor(if enabled {
+            CursorStyle::PointingHand
+        } else {
+            CursorStyle::Arrow
+        })
+        .id(id)
+        .hover(|style| style.bg(theme.hover))
+        .tooltip(move |_window, cx| {
+            cx.new(|_| TooltipView {
+                text: tooltip.clone(),
+                theme,
+            })
+            .into()
+        })
+        .on_click(cx.listener(move |this, _event, window, cx| {
+            if enabled {
+                on_click(this, window, cx);
+            }
+            cx.stop_propagation();
+        }))
+        .child(icon)
 }
 
 struct TooltipView {

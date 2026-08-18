@@ -16,6 +16,14 @@ _Avoid_: global model, window cache
 An independent local file view with its own directory snapshot, selection, sorting, search session, preview, and asynchronous request state.
 _Avoid_: yazi tab, process tab
 
+**Tab Strip**:
+The horizontal workspace control that shows GUI Tabs and opens new tabs. It shows all tabs followed by the new-tab control while they fit; after overflow, it shows the left navigation control, visible tabs, the right navigation control, and then the new-tab control.
+_Avoid_: yazi tab bar, browser chrome
+
+**Tab Viewport**:
+The contiguous visible window of the Tab Strip after overflow. It keeps the active tab visible, shifts one tab at a time with the conditional side controls, and hides older tabs from the leading edge when the minimum tab width is reached.
+_Avoid_: tab cache, hidden tab list
+
 **Yazi Session**:
 The single yazi backend process shared by GUI tabs. GUI tabs are local views over this session and accept events only for their current directory.
 _Avoid_: one process per tab, protocol bridge state

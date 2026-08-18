@@ -5,6 +5,9 @@ use std::process::{Child, Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 /// 一个文件条目（来自 yazi 插件发布的文件列表）。
 #[derive(Debug, Clone)]
 pub struct FileEntry {
@@ -170,6 +173,14 @@ fn bundled_binary(name: &str) -> Result<PathBuf> {
     }
 }
 
+fn hide_console(command: &mut Command) {
+    #[cfg(windows)]
+    command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+
+    #[cfg(not(windows))]
+    let _ = command;
+}
+
 /// 一个 yazi 后端进程的客户端句柄：负责启动进程、接收事件、发送动作。
 pub struct YaziClient {
     client_id: String,
@@ -186,7 +197,8 @@ impl YaziClient {
         let config_home = runtime_config_home()?;
         let yazi = yazi_binary()?;
 
-        let mut child = Command::new(yazi)
+        let mut command = Command::new(yazi);
+        command
             .args([
                 "--client-id",
                 client_id.as_str(),
@@ -197,8 +209,9 @@ impl YaziClient {
             .current_dir(cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
+            .stderr(Stdio::null());
+        hide_console(&mut command);
+        let mut child = command.spawn()?;
 
         let stdout = child.stdout.take().expect("stdout must be piped");
         let (tx, rx) = unbounded_channel::<YaziEvent>();
@@ -247,7 +260,10 @@ impl YaziClient {
         args.extend(action.iter().map(String::as_str));
 
         let ya = ya_binary()?;
-        let out = Command::new(ya).args(&args).stdin(Stdio::null()).output()?;
+        let mut command = Command::new(ya);
+        command.args(&args).stdin(Stdio::null());
+        hide_console(&mut command);
+        let out = command.output()?;
 
         let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();

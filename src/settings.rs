@@ -267,6 +267,8 @@ pub fn translate(language: Language, text: &str) -> String {
         "新建文件夹" => "New folder".to_string(),
         "新建标签页" => "New tab".to_string(),
         "关闭标签页" => "Close tab".to_string(),
+        "向左滚动标签页" => "Scroll tabs left".to_string(),
+        "向右滚动标签页" => "Scroll tabs right".to_string(),
         "设置" => "Settings".to_string(),
         "收藏" => "Favorite".to_string(),
         "取消收藏" => "Remove favorite".to_string(),

@@ -724,8 +724,8 @@ mod tests {
     #[test]
     fn newer_release_is_required_before_download() {
         let release = ReleaseInfo {
-            tag_name: "v0.2.1".to_string(),
-            version: Version::new(0, 2, 1),
+            tag_name: "v0.2.2".to_string(),
+            version: Version::new(0, 2, 2),
             page_url: String::new(),
             asset_name: String::new(),
             asset_url: String::new(),

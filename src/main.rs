@@ -1,3 +1,5 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use gpui::*;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::ops::Range;
@@ -48,7 +50,7 @@ mod ui;
 use ui::{
     InputElement, action_button, computer_button, dialog_button, icon_button, menu_item,
     menu_items_for, new_tab_button, parent_button, refresh_button, resize_handle, tab_button,
-    tab_name, toolbar_divider, window_control_button,
+    tab_name, tab_scroll_button, toolbar_divider, window_control_button,
 };
 mod settings;
 use settings::{AppSettings, Language, ThemeMode};
@@ -57,12 +59,98 @@ use tray::{TrayCommand, TrayController};
 mod update;
 
 const PRIMARY_YAZI_TAB: usize = 1;
+const TAB_DEFAULT_WIDTH: f32 = 160.0;
+const TAB_MIN_WIDTH: f32 = 112.0;
+const TAB_BAR_BUTTON_WIDTH: f32 = 32.0;
+const TAB_BAR_GAP: f32 = 4.0;
+const TAB_BAR_PADDING: f32 = 16.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TabBarMetrics {
+    show_arrows: bool,
+    visible_count: usize,
+    tab_width: f32,
+}
+
+fn tab_capacity(available: f32) -> usize {
+    (((available + TAB_BAR_GAP) / (TAB_MIN_WIDTH + TAB_BAR_GAP)).floor() as usize).max(1)
+}
+
+fn tab_width(available: f32, count: usize) -> f32 {
+    let gaps = TAB_BAR_GAP * count.saturating_sub(1) as f32;
+    ((available - gaps) / count as f32).clamp(TAB_MIN_WIDTH, TAB_DEFAULT_WIDTH)
+}
+
+fn tab_bar_metrics(window_width: f32, tab_count: usize) -> TabBarMetrics {
+    if tab_count == 0 {
+        return TabBarMetrics {
+            show_arrows: false,
+            visible_count: 0,
+            tab_width: 0.0,
+        };
+    }
+
+    let no_arrow_fixed = TAB_BAR_PADDING + TAB_BAR_GAP + TAB_BAR_BUTTON_WIDTH;
+    let no_arrow_available = (window_width - no_arrow_fixed).max(TAB_MIN_WIDTH);
+    let no_arrow_capacity = tab_capacity(no_arrow_available);
+    if tab_count <= no_arrow_capacity {
+        return TabBarMetrics {
+            show_arrows: false,
+            visible_count: tab_count,
+            tab_width: tab_width(no_arrow_available, tab_count),
+        };
+    }
+
+    let arrow_fixed = TAB_BAR_PADDING + TAB_BAR_GAP * 3.0 + TAB_BAR_BUTTON_WIDTH * 3.0;
+    let available = (window_width - arrow_fixed).max(TAB_MIN_WIDTH);
+    let visible_count = tab_count.min(tab_capacity(available));
+    TabBarMetrics {
+        show_arrows: true,
+        visible_count,
+        tab_width: tab_width(available, visible_count),
+    }
+}
+
+fn tab_view_start(
+    tab_count: usize,
+    visible_count: usize,
+    active: usize,
+    requested_start: usize,
+) -> usize {
+    let max_start = tab_count.saturating_sub(visible_count);
+    let mut start = requested_start.min(max_start);
+    if active < start {
+        start = active;
+    } else if active >= start + visible_count {
+        start = active + 1 - visible_count;
+    }
+    start.min(max_start)
+}
 
 fn default_start_dir() -> String {
     std::env::current_dir()
         .expect("current working directory is unavailable")
         .to_string_lossy()
         .into_owned()
+}
+
+const APPLICATION_ICON_ASSET: &str = "icons/yazi-gui.svg";
+
+struct AppAssets;
+
+impl AssetSource for AppAssets {
+    fn load(&self, path: &str) -> anyhow::Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        if path == APPLICATION_ICON_ASSET {
+            return Ok(Some(std::borrow::Cow::Borrowed(include_bytes!(
+                "../assets/icons/yazi-gui.svg"
+            ))));
+        }
+        Ok(None)
+    }
+
+    fn list(&self, _path: &str) -> anyhow::Result<Vec<SharedString>> {
+        Ok(Vec::new())
+    }
 }
 
 fn load_settings_or_exit() -> AppSettings {
@@ -437,6 +525,7 @@ struct Root {
     client: Option<YaziClient>,
     tabs: Vec<Tab>,
     active: usize,
+    tab_view_start: usize,
     drive_roots: Vec<String>,
     clipboard: Option<Clipboard>,
     transfer: Option<TransferState>,
@@ -488,6 +577,7 @@ impl Root {
             client: None,
             tabs: vec![Tab::new(&start_dir)],
             active: 0,
+            tab_view_start: 0,
             drive_roots: Vec::new(),
             clipboard: None,
             transfer: None,
@@ -539,6 +629,15 @@ impl Root {
 
     fn cur_mut(&mut self) -> &mut Tab {
         &mut self.tabs[self.active]
+    }
+
+    fn shift_tab_view(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if delta < 0 {
+            self.tab_view_start = self.tab_view_start.saturating_sub(delta.unsigned_abs());
+        } else {
+            self.tab_view_start = self.tab_view_start.saturating_add(delta as usize);
+        }
+        cx.notify();
     }
 
     fn begin_resize(&mut self, target: ResizeTarget, x: f32, cx: &mut Context<Self>) {
@@ -991,23 +1090,6 @@ impl Root {
         #[cfg(not(windows))]
         window.start_window_move();
         cx.stop_propagation();
-    }
-
-    fn application_icon_path() -> String {
-        #[cfg(debug_assertions)]
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("assets")
-            .join("icons")
-            .join("yazi-gui.svg");
-        #[cfg(not(debug_assertions))]
-        let path = std::env::current_exe()
-            .expect("current executable is unavailable")
-            .parent()
-            .expect("current executable has no parent directory")
-            .join("assets")
-            .join("icons")
-            .join("yazi-gui.svg");
-        path.to_string_lossy().into_owned()
     }
 
     fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2473,6 +2555,7 @@ impl Root {
         }
         self.tabs[self.active].invalidate_refresh();
         self.active = i;
+        self.tab_view_start = i;
         self.cur_mut().clear_preview();
         if self.tabs[i].computer_view {
             self.start_drive_scan(cx, true);
@@ -2493,6 +2576,7 @@ impl Root {
         tab.computer_view = true;
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
+        self.tab_view_start = self.active;
         self.folder_tree.reset();
         self.cur_mut().clear_preview();
         self.reset_file_scroll();
@@ -2510,8 +2594,12 @@ impl Root {
             cx.quit();
             return;
         }
+        if i < self.tab_view_start {
+            self.tab_view_start = self.tab_view_start.saturating_sub(1);
+        }
         self.tabs.remove(i);
         let len = self.tabs.len();
+        self.tab_view_start = self.tab_view_start.min(len - 1);
         if self.active > i {
             self.active -= 1;
         }
@@ -2899,6 +2987,7 @@ impl Root {
         let mut field = div()
             .flex()
             .flex_1()
+            .items_center()
             .key_context("YaziInput")
             .track_focus(&self.focus_handle)
             .cursor(CursorStyle::IBeam)
@@ -2946,6 +3035,8 @@ impl Root {
             .w(px(260.0))
             .h(px(28.0))
             .flex_shrink_0()
+            .flex()
+            .items_center()
             .px_2()
             .text_xs()
             .bg(theme.surface0)
@@ -2963,6 +3054,8 @@ impl Root {
             field = field.child(
                 div()
                     .flex_1()
+                    .flex()
+                    .items_center()
                     .text_xs()
                     .text_color(theme.muted)
                     .cursor_pointer()
@@ -3310,9 +3403,11 @@ impl Root {
                     .text_color(theme.blue)
                     .child(
                         svg()
-                            .path(Self::application_icon_path())
+                            .path(APPLICATION_ICON_ASSET)
+                            .id("titlebar-app-icon")
                             .w(px(18.0))
                             .h(px(18.0))
+                            .text_color(theme.blue)
                             .flex_shrink_0(),
                     ),
             )
@@ -3367,26 +3462,80 @@ impl Root {
             .into_any_element()
     }
 
-    fn tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn tab_bar(&mut self, window_width: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
-        div()
+        let metrics = tab_bar_metrics(window_width, self.tabs.len());
+        self.tab_view_start = tab_view_start(
+            self.tabs.len(),
+            metrics.visible_count,
+            self.active,
+            self.tab_view_start,
+        );
+        let end = (self.tab_view_start + metrics.visible_count).min(self.tabs.len());
+        let can_scroll_left = self.tab_view_start > 0;
+        let can_scroll_right = end < self.tabs.len();
+        let language = self.language();
+        let visible_tabs: Vec<_> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .skip(self.tab_view_start)
+            .take(metrics.visible_count)
+            .map(|(i, tab)| {
+                let name = if tab.computer_view {
+                    settings::translate(language, "此电脑")
+                } else {
+                    tab_name(&tab.cwd)
+                };
+                (i, SharedString::from(name), i == self.active)
+            })
+            .collect();
+
+        let tabs_view = div()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap_1()
+            .children(visible_tabs.into_iter().map(|(i, name, active)| {
+                tab_button(cx, theme, i, name, active, metrics.tab_width)
+            }));
+
+        let mut bar = div()
             .w_full()
             .px_2()
             .py_1()
             .bg(theme.crust)
             .flex()
             .items_center()
-            .gap_1()
-            .children(self.tabs.iter().enumerate().map(|(i, tab)| {
-                let active = i == self.active;
-                let name = SharedString::from(if tab.computer_view {
-                    self.tr("此电脑")
-                } else {
-                    tab_name(&tab.cwd)
-                });
-                tab_button(cx, theme, i, name, active)
-            }))
-            .child(new_tab_button(cx, theme, self.language()))
+            .gap_1();
+
+        if metrics.show_arrows {
+            bar = bar.child(tab_scroll_button(
+                cx,
+                theme,
+                "tab-scroll-left",
+                "‹",
+                settings::translate(language, "向左滚动标签页"),
+                can_scroll_left,
+                |this, _window, cx| this.shift_tab_view(-1, cx),
+            ));
+        }
+
+        bar = bar.child(tabs_view);
+
+        if metrics.show_arrows {
+            bar = bar.child(tab_scroll_button(
+                cx,
+                theme,
+                "tab-scroll-right",
+                "›",
+                settings::translate(language, "向右滚动标签页"),
+                can_scroll_right,
+                |this, _window, cx| this.shift_tab_view(1, cx),
+            ));
+        }
+
+        bar.child(new_tab_button(cx, theme, self.language()))
     }
 
     fn context_menu(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -3573,10 +3722,11 @@ impl EntityInputHandler for Root {
 }
 
 impl Render for Root {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.page == Page::Settings {
             return self.settings_page(cx);
         }
+        let tab_bar_width = f32::from(window.bounds().size.width);
         let computer_view = self.cur().computer_view;
         let cwd = SharedString::from(if computer_view {
             self.tr("此电脑")
@@ -3725,7 +3875,7 @@ impl Render for Root {
                 this.on_input_key(event, window, cx);
             }))
             .child(self.titlebar(cx))
-            .child(self.tab_bar(cx))
+            .child(self.tab_bar(tab_bar_width, cx))
             .child(
                 div()
                     .w_full()
@@ -4222,69 +4372,73 @@ fn main() {
         }
     }
     let background = args.iter().any(|arg| arg == "--background");
-    Application::new().run(move |cx: &mut App| {
-        cx.bind_keys([
-            KeyBinding::new("backspace", Backspace, None),
-            KeyBinding::new("delete", Delete, None),
-            KeyBinding::new("left", Left, None),
-            KeyBinding::new("right", Right, None),
-            KeyBinding::new("shift-left", SelectLeft, None),
-            KeyBinding::new("shift-right", SelectRight, None),
-            KeyBinding::new("ctrl-a", SelectAll, None),
-            KeyBinding::new("ctrl-c", CopyText, None),
-            KeyBinding::new("ctrl-v", PasteText, None),
-            KeyBinding::new("ctrl-x", CutText, None),
-            KeyBinding::new("home", Home, None),
-            KeyBinding::new("end", End, None),
-        ]);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::centered(size(px(1000.0), px(650.0)), cx)),
-                show: !background,
-                focus: !background,
-                titlebar: None,
-                ..Default::default()
-            },
-            |window, cx| {
-                let root = cx.new(|cx| Root::new(cx));
-                let window_handle = gpui::Window::window_handle(window);
-                root.update(cx, |root, _cx| {
-                    root.window_handle = Some(window_handle);
-                });
-                root.update(cx, |root, cx| {
-                    let focus_handle = root.focus_handle.clone();
-                    root.input_blur_subscription =
-                        Some(cx.on_blur(&focus_handle, window, |this, _window, cx| {
-                            if matches!(this.pending, Some(PendingOp::GoToPath)) {
-                                this.cancel_input_state();
-                                cx.notify();
-                            } else if this.is_inline_editing() {
-                                this.confirm_input(cx);
-                            }
-                        }));
-                });
-                let weak = root.downgrade();
-                window.on_window_should_close(cx, move |window, cx| {
-                    weak.update(cx, |root, cx| root.handle_window_close(window, cx))
-                        .unwrap_or(true)
-                });
-                root
-            },
-        )
-        .unwrap();
-    });
+    Application::new()
+        .with_assets(AppAssets)
+        .run(move |cx: &mut App| {
+            cx.bind_keys([
+                KeyBinding::new("backspace", Backspace, None),
+                KeyBinding::new("delete", Delete, None),
+                KeyBinding::new("left", Left, None),
+                KeyBinding::new("right", Right, None),
+                KeyBinding::new("shift-left", SelectLeft, None),
+                KeyBinding::new("shift-right", SelectRight, None),
+                KeyBinding::new("ctrl-a", SelectAll, None),
+                KeyBinding::new("ctrl-c", CopyText, None),
+                KeyBinding::new("ctrl-v", PasteText, None),
+                KeyBinding::new("ctrl-x", CutText, None),
+                KeyBinding::new("home", Home, None),
+                KeyBinding::new("end", End, None),
+            ]);
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::centered(size(px(1000.0), px(650.0)), cx)),
+                    show: !background,
+                    focus: !background,
+                    titlebar: None,
+                    ..Default::default()
+                },
+                |window, cx| {
+                    let root = cx.new(|cx| Root::new(cx));
+                    let window_handle = gpui::Window::window_handle(window);
+                    root.update(cx, |root, _cx| {
+                        root.window_handle = Some(window_handle);
+                    });
+                    root.update(cx, |root, cx| {
+                        let focus_handle = root.focus_handle.clone();
+                        root.input_blur_subscription =
+                            Some(cx.on_blur(&focus_handle, window, |this, _window, cx| {
+                                if matches!(this.pending, Some(PendingOp::GoToPath)) {
+                                    this.cancel_input_state();
+                                    cx.notify();
+                                } else if this.is_inline_editing() {
+                                    this.confirm_input(cx);
+                                }
+                            }));
+                    });
+                    let weak = root.downgrade();
+                    window.on_window_should_close(cx, move |window, cx| {
+                        weak.update(cx, |root, cx| root.handle_window_close(window, cx))
+                            .unwrap_or(true)
+                    });
+                    root
+                },
+            )
+            .unwrap();
+        });
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        DeleteSummary, FileEntry, LayoutState, MODIFIED_WIDTH_MIN, PREVIEW_WIDTH_MAX, ResizeTarget,
-        SortDirection, SortField, SortState, TREE_WIDTH_MIN, TransferOutcome, clamp_layout_width,
+        APPLICATION_ICON_ASSET, AppAssets, DeleteSummary, FileEntry, LayoutState,
+        MODIFIED_WIDTH_MIN, PREVIEW_WIDTH_MAX, ResizeTarget, SortDirection, SortField, SortState,
+        TAB_DEFAULT_WIDTH, TAB_MIN_WIDTH, TREE_WIDTH_MIN, TransferOutcome, clamp_layout_width,
         copy_paths_with_progress, delete_status, favorite_path_key, format_mtime,
         horizontal_scrollbar_metrics, is_primary_yazi_tab, is_unc_path, keystroke_to_shortcut,
         normalize_favorite_path, normalize_shortcut, normalize_single_path, permanent_delete,
         reconcile_selection, refresh_request_matches, refresh_token_matches, resolve_address_path,
-        scan_folder_children, search_directory, sort_files, tree_ancestor_paths, tree_path_key,
+        scan_folder_children, search_directory, sort_files, tab_bar_metrics, tab_view_start,
+        tree_ancestor_paths, tree_path_key,
     };
     use std::fs;
     use std::sync::atomic::AtomicBool;
@@ -4647,5 +4801,39 @@ mod tests {
         let (thumb, travel) = horizontal_scrollbar_metrics(640.0, 640.0).unwrap();
         assert_eq!(thumb, 320.0);
         assert_eq!(travel, 320.0);
+    }
+
+    #[test]
+    fn tab_bar_keeps_default_width_until_it_needs_to_share_space() {
+        let metrics = tab_bar_metrics(1000.0, 5);
+        assert!(!metrics.show_arrows);
+        assert_eq!(metrics.visible_count, 5);
+        assert_eq!(metrics.tab_width, TAB_DEFAULT_WIDTH);
+
+        let metrics = tab_bar_metrics(1000.0, 6);
+        assert!(!metrics.show_arrows);
+        assert_eq!(metrics.visible_count, 6);
+        assert!(metrics.tab_width < TAB_DEFAULT_WIDTH);
+        assert!(metrics.tab_width >= TAB_MIN_WIDTH);
+
+        let metrics = tab_bar_metrics(1000.0, 9);
+        assert!(metrics.show_arrows);
+        assert_eq!(metrics.visible_count, 7);
+        assert!(metrics.tab_width >= TAB_MIN_WIDTH);
+    }
+
+    #[test]
+    fn tab_view_keeps_active_tab_visible_when_the_strip_overflows() {
+        assert_eq!(tab_view_start(9, 7, 8, 0), 2);
+        assert_eq!(tab_view_start(9, 7, 0, 2), 0);
+        assert_eq!(tab_view_start(9, 7, 4, 1), 1);
+    }
+
+    #[test]
+    fn embedded_application_icon_is_available_to_gpui() {
+        let bytes = <AppAssets as gpui::AssetSource>::load(&AppAssets, APPLICATION_ICON_ASSET)
+            .unwrap()
+            .unwrap();
+        assert!(bytes.starts_with(b"<svg"));
     }
 }

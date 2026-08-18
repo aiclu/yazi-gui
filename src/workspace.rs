@@ -168,6 +168,14 @@ impl FolderTreeState {
         self.expanded.values().cloned().collect()
     }
 
+    pub(crate) fn reset(&mut self) {
+        self.expanded.clear();
+        self.children.clear();
+        self.loading.clear();
+        self.errors.clear();
+        self.next_scan_id = self.next_scan_id.wrapping_add(1);
+    }
+
     pub(crate) fn invalidate(&mut self, path: &str) {
         let key = tree_path_key(path);
         self.children.remove(&key);

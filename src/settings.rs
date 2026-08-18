@@ -250,6 +250,12 @@ pub fn translate(language: Language, text: &str) -> String {
             "Refreshing; finish it before exiting".to_string()
         }
         "上级 .." => "Parent ..".to_string(),
+        "上级" => "Parent".to_string(),
+        "收藏当前目录" => "Favorite current folder".to_string(),
+        "取消收藏当前目录" => "Remove current folder favorite".to_string(),
+        "最小化" => "Minimize".to_string(),
+        "最大化" => "Maximize".to_string(),
+        "关闭" => "Close".to_string(),
         "打开" => "Open".to_string(),
         "搜索" => "Search".to_string(),
         "删除" => "Delete".to_string(),

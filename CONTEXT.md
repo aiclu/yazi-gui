@@ -56,6 +56,22 @@ _Avoid_: detail pane, inspector
 The optional right-side surface that displays the Preview for the active selection.
 _Avoid_: inspector pane, details sidebar
 
+**Resizable Pane**:
+A visible boundary whose drag changes the width of the Folder Tree, file list columns, or Preview Panel for the current session.
+_Avoid_: persisted layout profile, responsive breakpoint
+
+**File Column Layout**:
+The shared Name, Modified, and Size column widths used by both the list header and every file row. The three columns stay inside one file-list horizontal viewport; its bottom scrollbar moves the header and rows together, while the ordinary wheel remains vertical.
+_Avoid_: independent row alignment, floating metadata
+
+**Application Titlebar**:
+The custom top strip containing the SVG application identity, Settings control, native window controls, and the Windows non-client drag bridge.
+_Avoid_: toolbar, external window chrome
+
+**Command Tooltip**:
+The localized label shown when the pointer rests on an icon-only command button.
+_Avoid_: hidden command name, text toolbar label
+
 **File Search Field**:
 The always-visible file-page input that searches the active real directory by name or relative path.
 _Avoid_: address input

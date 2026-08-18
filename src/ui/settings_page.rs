@@ -53,6 +53,7 @@ pub(crate) fn render(root: &Root, cx: &mut Context<Root>) -> AnyElement {
         .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
             this.on_input_key(event, window, cx);
         }))
+        .child(root.titlebar(cx))
         .child(
             div()
                 .w_full()
@@ -151,35 +152,19 @@ pub(crate) fn render(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                                         .child(root.tr("自启动默认关闭")),
                                 ),
                         ))
-                        .child(section_card(
+                        .child(section_card_with_title(
                             theme,
-                            SharedString::from(format!(
-                                "{} {}",
-                                if root.shortcuts_expanded {
-                                    "▾"
-                                } else {
-                                    "▸"
-                                },
-                                root.tr("快捷键")
-                            )),
                             div()
                                 .w_full()
-                                .flex()
-                                .flex_col()
-                                .gap_1()
-                                .child(
-                                    div()
-                                        .py_1()
-                                        .text_xs()
-                                        .text_color(theme.muted)
-                                        .cursor_pointer()
-                                        .id("settings-shortcuts-toggle")
-                                        .on_click(cx.listener(|this, _event, _window, cx| {
-                                            this.toggle_shortcuts(cx);
-                                        }))
-                                        .child(shortcuts_label),
-                                )
-                                .children(shortcuts),
+                                .py_1()
+                                .text_lg()
+                                .cursor_pointer()
+                                .id("settings-shortcuts-toggle")
+                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                    this.toggle_shortcuts(cx);
+                                }))
+                                .child(shortcuts_label),
+                            div().w_full().flex().flex_col().gap_1().children(shortcuts),
                         ))
                         .child(section_card(
                             theme,
@@ -217,6 +202,14 @@ fn section_card(
     title: impl Into<SharedString>,
     body: impl IntoElement,
 ) -> AnyElement {
+    section_card_with_title(theme, div().text_lg().child(title.into()), body)
+}
+
+fn section_card_with_title(
+    theme: Theme,
+    title: impl IntoElement,
+    body: impl IntoElement,
+) -> AnyElement {
     div()
         .w_full()
         .p_4()
@@ -227,7 +220,7 @@ fn section_card(
         .flex()
         .flex_col()
         .gap_3()
-        .child(div().text_lg().child(title.into()))
+        .child(title)
         .child(body)
         .into_any_element()
 }

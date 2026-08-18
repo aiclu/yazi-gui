@@ -1,8 +1,9 @@
 use super::super::*;
-use super::components::{file_row, sort_header};
+use super::components::{file_row, resize_handle, sort_header};
 
 pub(crate) fn file_list(root: &Root, cx: &Context<Root>) -> impl IntoElement {
     let theme = root.theme;
+    let layout = root.layout;
     let computer_view = root.cur().computer_view;
     let search_active = root
         .cur()
@@ -51,25 +52,27 @@ pub(crate) fn file_list(root: &Root, cx: &Context<Root>) -> impl IntoElement {
         entries.push((String::new(), false, 0, 0.0, true));
     }
 
-    div()
+    let mut horizontal_viewport = div()
         .flex_1()
+        .w_full()
+        .min_w(px(0.0))
+        .h_full()
+        .id("file-horizontal-viewport")
+        .overflow_x_scroll()
+        .scrollbar_width(px(0.0))
+        .track_scroll(&root.file_scroll);
+    horizontal_viewport.style().restrict_scroll_to_axis = Some(true);
+
+    let table = div()
+        .w_full()
+        .min_w(px(layout.file_list_min_width()))
+        .flex_shrink_0()
         .h_full()
         .flex()
         .flex_col()
-        .id("file-list")
-        .on_click(cx.listener(|this, _event, _window, cx| {
-            this.click_blank(cx);
-        }))
-        .on_mouse_down(
-            MouseButton::Right,
-            cx.listener(|this, event: &MouseDownEvent, _window, cx| {
-                this.open_menu(None, event.position, cx);
-                cx.stop_propagation();
-            }),
-        )
         .child(file_header(root, cx, theme))
         .child(
-            div().flex_1().h_full().child(
+            div().flex_1().w_full().h_full().child(
                 uniform_list(
                     "file-list-items",
                     entries.len(),
@@ -100,6 +103,7 @@ pub(crate) fn file_list(root: &Root, cx: &Context<Root>) -> impl IntoElement {
                                     file_row(
                                         list_cx,
                                         theme,
+                                        layout,
                                         name,
                                         is_dir,
                                         size,
@@ -116,11 +120,91 @@ pub(crate) fn file_list(root: &Root, cx: &Context<Root>) -> impl IntoElement {
                 )
                 .h_full(),
             ),
+        );
+    horizontal_viewport = horizontal_viewport.child(table);
+
+    div()
+        .flex_1()
+        .min_w(px(0.0))
+        .h_full()
+        .flex()
+        .flex_col()
+        .id("file-list")
+        .on_click(cx.listener(|this, _event, _window, cx| {
+            this.click_blank(cx);
+        }))
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                this.open_menu(None, event.position, cx);
+                cx.stop_propagation();
+            }),
         )
+        .child(horizontal_viewport)
+        .child(horizontal_scrollbar(root, cx, theme))
+}
+
+fn horizontal_scrollbar(root: &Root, cx: &Context<Root>, theme: Theme) -> AnyElement {
+    let viewport_width = f32::from(root.file_scroll.bounds().size.width);
+    let max_offset = f32::from(root.file_scroll.max_offset().width);
+    let Some((thumb_width, travel)) = horizontal_scrollbar_metrics(viewport_width, max_offset)
+    else {
+        return div().h(px(0.0)).flex_shrink_0().into_any_element();
+    };
+    let offset = (-f32::from(root.file_scroll.offset().x)).clamp(0.0, max_offset);
+    let thumb_left = if max_offset == 0.0 {
+        0.0
+    } else {
+        offset / max_offset * travel
+    };
+    let thumb = div()
+        .absolute()
+        .left(px(thumb_left))
+        .top(px(2.0))
+        .w(px(thumb_width))
+        .h(px(8.0))
+        .bg(theme.border)
+        .rounded_sm()
+        .cursor(CursorStyle::ResizeLeftRight)
+        .hover(|style| style.bg(theme.blue))
+        .id("file-horizontal-scroll-thumb")
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                this.begin_file_scroll_drag(f32::from(event.position.x), cx);
+                cx.stop_propagation();
+            }),
+        )
+        .on_mouse_up_out(
+            MouseButton::Left,
+            cx.listener(|this, _event, _window, cx| this.end_file_scroll_drag(cx)),
+        )
+        .on_drag(
+            HorizontalScrollDrag,
+            |_drag: &HorizontalScrollDrag, _position, _window, cx| {
+                cx.new(|_| HorizontalScrollGhost)
+            },
+        )
+        .on_drag_move(cx.listener(
+            |this, event: &DragMoveEvent<HorizontalScrollDrag>, _window, cx| {
+                this.move_file_scroll_drag(f32::from(event.event.position.x), cx);
+            },
+        ));
+
+    div()
+        .w_full()
+        .h(px(12.0))
+        .flex_shrink_0()
+        .bg(theme.crust)
+        .border_t_1()
+        .border_color(theme.border)
+        .child(thumb)
+        .into_any_element()
 }
 
 pub(crate) fn file_header(root: &Root, cx: &Context<Root>, theme: Theme) -> AnyElement {
     let sort = root.cur().sort;
+    let layout = root.layout;
     div()
         .w_full()
         .px_3()
@@ -130,34 +214,34 @@ pub(crate) fn file_header(root: &Root, cx: &Context<Root>, theme: Theme) -> AnyE
         .border_color(theme.border)
         .flex()
         .items_center()
-        .gap_3()
+        .gap_0()
         .child(sort_header(
             cx,
             theme,
             root.tr("名称"),
             SortField::Name,
             sort,
-            true,
-            0.0,
+            layout.name_width,
         ))
+        .child(resize_handle(cx, theme, ResizeTarget::NameColumn))
         .child(sort_header(
             cx,
             theme,
             root.tr("修改时间"),
             SortField::Modified,
             sort,
-            false,
-            135.0,
+            layout.modified_width,
         ))
+        .child(resize_handle(cx, theme, ResizeTarget::ModifiedColumn))
         .child(sort_header(
             cx,
             theme,
             root.tr("大小"),
             SortField::Size,
             sort,
-            false,
-            80.0,
+            layout.size_width,
         ))
+        .child(resize_handle(cx, theme, ResizeTarget::SizeColumn))
         .into_any_element()
 }
 
@@ -170,7 +254,7 @@ pub(crate) fn preview_pane(root: &Root) -> impl IntoElement {
     });
 
     div()
-        .w(px(320.0))
+        .w(px(root.layout.preview_width))
         .flex_shrink_0()
         .h_full()
         .flex()
@@ -191,7 +275,7 @@ pub(crate) fn preview_pane(root: &Root) -> impl IntoElement {
         )
         .child(
             div()
-                .w(px(320.0))
+                .w_full()
                 .flex_shrink_0()
                 .h_full()
                 .id("preview-content")

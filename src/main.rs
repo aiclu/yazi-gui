@@ -46,9 +46,9 @@ use workspace::{
 };
 mod ui;
 use ui::{
-    InputElement, action_button, command_button, computer_button, dialog_button, menu_item,
-    menu_items_for, new_tab_button, parent_button, refresh_button, tab_button, tab_name,
-    toolbar_divider,
+    InputElement, action_button, computer_button, dialog_button, icon_button, menu_item,
+    menu_items_for, new_tab_button, parent_button, refresh_button, resize_handle, tab_button,
+    tab_name, toolbar_divider, window_control_button,
 };
 mod settings;
 use settings::{AppSettings, Language, ThemeMode};
@@ -262,6 +262,109 @@ struct MenuState {
     position: Point<Pixels>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResizeTarget {
+    FolderTree,
+    Preview,
+    NameColumn,
+    ModifiedColumn,
+    SizeColumn,
+}
+
+#[derive(Clone, Copy)]
+struct ResizeSession {
+    target: ResizeTarget,
+    start_x: f32,
+    start_value: f32,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct LayoutState {
+    pub(crate) tree_width: f32,
+    pub(crate) preview_width: f32,
+    pub(crate) name_width: f32,
+    pub(crate) modified_width: f32,
+    pub(crate) size_width: f32,
+    resize: Option<ResizeSession>,
+}
+
+impl Default for LayoutState {
+    fn default() -> Self {
+        Self {
+            tree_width: 240.0,
+            preview_width: 320.0,
+            name_width: 360.0,
+            modified_width: 135.0,
+            size_width: 80.0,
+            resize: None,
+        }
+    }
+}
+
+impl LayoutState {
+    pub(crate) fn file_list_min_width(&self) -> f32 {
+        self.name_width + self.modified_width + self.size_width + 18.0 + 24.0
+    }
+}
+
+const TREE_WIDTH_MIN: f32 = 160.0;
+const TREE_WIDTH_MAX: f32 = 420.0;
+const PREVIEW_WIDTH_MIN: f32 = 220.0;
+const PREVIEW_WIDTH_MAX: f32 = 560.0;
+const NAME_WIDTH_MIN: f32 = 180.0;
+const NAME_WIDTH_MAX: f32 = 900.0;
+const MODIFIED_WIDTH_MIN: f32 = 105.0;
+const MODIFIED_WIDTH_MAX: f32 = 240.0;
+const SIZE_WIDTH_MIN: f32 = 60.0;
+const SIZE_WIDTH_MAX: f32 = 180.0;
+
+fn clamp_layout_width(target: ResizeTarget, value: f32) -> f32 {
+    match target {
+        ResizeTarget::FolderTree => value.clamp(TREE_WIDTH_MIN, TREE_WIDTH_MAX),
+        ResizeTarget::Preview => value.clamp(PREVIEW_WIDTH_MIN, PREVIEW_WIDTH_MAX),
+        ResizeTarget::NameColumn => value.clamp(NAME_WIDTH_MIN, NAME_WIDTH_MAX),
+        ResizeTarget::ModifiedColumn => value.clamp(MODIFIED_WIDTH_MIN, MODIFIED_WIDTH_MAX),
+        ResizeTarget::SizeColumn => value.clamp(SIZE_WIDTH_MIN, SIZE_WIDTH_MAX),
+    }
+}
+
+pub(crate) fn horizontal_scrollbar_metrics(
+    viewport_width: f32,
+    max_offset: f32,
+) -> Option<(f32, f32)> {
+    if viewport_width <= 0.0 || max_offset <= 0.0 {
+        return None;
+    }
+    let content_width = viewport_width + max_offset;
+    let thumb_width = (viewport_width * viewport_width / content_width).clamp(32.0, viewport_width);
+    Some((thumb_width, (viewport_width - thumb_width).max(0.0)))
+}
+
+struct ResizeGhost;
+
+impl Render for ResizeGhost {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HorizontalScrollDrag;
+
+struct HorizontalScrollGhost;
+
+impl Render for HorizontalScrollGhost {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HorizontalScrollSession {
+    start_x: f32,
+    start_offset: f32,
+}
+
 struct PendingDelete {
     cwd: String,
     paths: Vec<String>,
@@ -361,6 +464,9 @@ struct Root {
     close_requested: bool,
     shortcuts_expanded: bool,
     update: UpdateState,
+    layout: LayoutState,
+    pub(crate) file_scroll: ScrollHandle,
+    file_scroll_drag: Option<HorizontalScrollSession>,
 }
 
 impl Root {
@@ -409,6 +515,9 @@ impl Root {
             close_requested: false,
             shortcuts_expanded: false,
             update: UpdateState::default(),
+            layout: LayoutState::default(),
+            file_scroll: ScrollHandle::new(),
+            file_scroll_drag: None,
         };
         if let Some(mut rx) = tray_rx.take() {
             cx.spawn(async move |weak, cx| {
@@ -430,6 +539,97 @@ impl Root {
 
     fn cur_mut(&mut self) -> &mut Tab {
         &mut self.tabs[self.active]
+    }
+
+    fn begin_resize(&mut self, target: ResizeTarget, x: f32, cx: &mut Context<Self>) {
+        let start_value = match target {
+            ResizeTarget::FolderTree => self.layout.tree_width,
+            ResizeTarget::Preview => self.layout.preview_width,
+            ResizeTarget::NameColumn => self.layout.name_width,
+            ResizeTarget::ModifiedColumn => self.layout.modified_width,
+            ResizeTarget::SizeColumn => self.layout.size_width,
+        };
+        self.layout.resize = Some(ResizeSession {
+            target,
+            start_x: x,
+            start_value,
+        });
+        cx.notify();
+    }
+
+    fn resize_layout(&mut self, x: f32, cx: &mut Context<Self>) {
+        let Some(session) = self.layout.resize else {
+            return;
+        };
+        let delta = x - session.start_x;
+        let value = session.start_value
+            + match session.target {
+                ResizeTarget::Preview => -delta,
+                _ => delta,
+            };
+        match session.target {
+            ResizeTarget::FolderTree => {
+                self.layout.tree_width = clamp_layout_width(session.target, value)
+            }
+            ResizeTarget::Preview => {
+                self.layout.preview_width = clamp_layout_width(session.target, value)
+            }
+            ResizeTarget::NameColumn => {
+                self.layout.name_width = clamp_layout_width(session.target, value)
+            }
+            ResizeTarget::ModifiedColumn => {
+                self.layout.modified_width = clamp_layout_width(session.target, value)
+            }
+            ResizeTarget::SizeColumn => {
+                self.layout.size_width = clamp_layout_width(session.target, value)
+            }
+        }
+        cx.notify();
+    }
+
+    fn end_resize(&mut self, cx: &mut Context<Self>) {
+        if self.layout.resize.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn begin_file_scroll_drag(&mut self, x: f32, cx: &mut Context<Self>) {
+        self.file_scroll_drag = Some(HorizontalScrollSession {
+            start_x: x,
+            start_offset: -f32::from(self.file_scroll.offset().x),
+        });
+        cx.notify();
+    }
+
+    fn move_file_scroll_drag(&mut self, x: f32, cx: &mut Context<Self>) {
+        let Some(session) = self.file_scroll_drag else {
+            return;
+        };
+        let viewport_width = f32::from(self.file_scroll.bounds().size.width);
+        let max_offset = f32::from(self.file_scroll.max_offset().width);
+        let Some((_, travel)) = horizontal_scrollbar_metrics(viewport_width, max_offset) else {
+            return;
+        };
+        let scroll_delta = if travel == 0.0 {
+            0.0
+        } else {
+            (x - session.start_x) * max_offset / travel
+        };
+        let offset = (session.start_offset + scroll_delta).clamp(0.0, max_offset);
+        let current = self.file_scroll.offset();
+        self.file_scroll.set_offset(point(px(-offset), current.y));
+        cx.notify();
+    }
+
+    fn end_file_scroll_drag(&mut self, cx: &mut Context<Self>) {
+        if self.file_scroll_drag.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn reset_file_scroll(&self) {
+        let current = self.file_scroll.offset();
+        self.file_scroll.set_offset(point(px(0.0), current.y));
     }
 
     fn visible_files(&self) -> &[FileEntry] {
@@ -752,6 +952,85 @@ impl Root {
     #[cfg(not(windows))]
     fn hide_native_window(&self, _window: &Window) {}
 
+    fn minimize_window(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
+        window.minimize_window();
+    }
+
+    fn toggle_maximize(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
+        #[cfg(windows)]
+        if let Some(hwnd) = Self::window_hwnd(window) {
+            let command = if window.is_maximized() {
+                windows_sys::Win32::UI::WindowsAndMessaging::SW_RESTORE
+            } else {
+                windows_sys::Win32::UI::WindowsAndMessaging::SW_MAXIMIZE
+            };
+            unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::ShowWindowAsync(hwnd, command);
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = window;
+    }
+
+    fn begin_window_move(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.pending, Some(PendingOp::Search)) {
+            self.cancel_input_state();
+        }
+        #[cfg(windows)]
+        if let Some(hwnd) = Self::window_hwnd(window) {
+            unsafe {
+                windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
+                windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(
+                    hwnd,
+                    windows_sys::Win32::UI::WindowsAndMessaging::WM_NCLBUTTONDOWN,
+                    windows_sys::Win32::UI::WindowsAndMessaging::HTCAPTION as usize,
+                    0,
+                );
+            }
+        }
+        #[cfg(not(windows))]
+        window.start_window_move();
+        cx.stop_propagation();
+    }
+
+    fn application_icon_path() -> String {
+        #[cfg(debug_assertions)]
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets")
+            .join("icons")
+            .join("yazi-gui.svg");
+        #[cfg(not(debug_assertions))]
+        let path = std::env::current_exe()
+            .expect("current executable is unavailable")
+            .parent()
+            .expect("current executable has no parent directory")
+            .join("assets")
+            .join("icons")
+            .join("yazi-gui.svg");
+        path.to_string_lossy().into_owned()
+    }
+
+    fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(windows)]
+        let _ = cx;
+        #[cfg(windows)]
+        if let Some(hwnd) = Self::window_hwnd(window) {
+            unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    hwnd,
+                    windows_sys::Win32::UI::WindowsAndMessaging::WM_CLOSE,
+                    0,
+                    0,
+                );
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = window;
+            cx.quit();
+        }
+    }
+
     fn show_native_window(&self, cx: &mut Context<Self>) {
         let Some(handle) = self.window_handle else {
             return;
@@ -987,6 +1266,7 @@ impl Root {
         } else {
             self.move_input_cursor(offset, cx);
         }
+        cx.stop_propagation();
     }
 
     fn input_mouse_up(&mut self, _: &MouseUpEvent, _window: &mut Window, _cx: &mut Context<Self>) {
@@ -2201,19 +2481,22 @@ impl Root {
             self.send(&["cd", cwd.as_str()]);
             self.sync_folder_tree_to_path(&cwd, cx);
         }
+        self.reset_file_scroll();
         cx.notify();
     }
 
     fn new_tab(&mut self, cx: &mut Context<Self>) {
         self.cancel_input_state();
         self.clear_status();
-        let cwd = self.cur().cwd.clone();
         self.cur_mut().invalidate_refresh();
-        self.tabs.push(Tab::new(&cwd));
+        let mut tab = Tab::new("");
+        tab.computer_view = true;
+        self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
+        self.folder_tree.reset();
         self.cur_mut().clear_preview();
-        self.send(&["cd", cwd.as_str()]);
-        self.sync_folder_tree_to_path(&cwd, cx);
+        self.reset_file_scroll();
+        self.start_drive_scan(cx, false);
         cx.notify();
     }
 
@@ -2658,11 +2941,13 @@ impl Root {
 
     fn file_search_field(&self, cx: &mut Context<Root>) -> AnyElement {
         let theme = self.theme;
-        let active = matches!(self.pending, None | Some(PendingOp::Search));
+        let active = matches!(self.pending, Some(PendingOp::Search));
         let mut field = div()
             .w(px(260.0))
             .h(px(28.0))
+            .flex_shrink_0()
             .px_2()
+            .text_xs()
             .bg(theme.surface0)
             .border_1()
             .border_color(theme.border)
@@ -2678,8 +2963,14 @@ impl Root {
             field = field.child(
                 div()
                     .flex_1()
-                    .text_sm()
+                    .text_xs()
                     .text_color(theme.muted)
+                    .cursor_pointer()
+                    .id("file-search-placeholder")
+                    .on_click(cx.listener(|this, _event, window, cx| {
+                        this.start_search(window, cx);
+                        cx.stop_propagation();
+                    }))
                     .child(self.tr("搜索文件...")),
             );
         }
@@ -2708,7 +2999,7 @@ impl Root {
         .h_full();
 
         div()
-            .w(px(240.0))
+            .w(px(self.layout.tree_width))
             .h_full()
             .flex_shrink_0()
             .flex()
@@ -2838,6 +3129,9 @@ impl Root {
                         div()
                             .flex_1()
                             .text_sm()
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_ellipsis()
                             .text_color(if selected { theme.blue } else { theme.text })
                             .child(entry.name),
                     )
@@ -2942,12 +3236,13 @@ impl Root {
             .flex_1()
             .h_full()
             .flex_row()
+            .id("content-row")
             .child(self.folder_tree_pane(cx))
-            .child(div().w(px(1.0)).bg(theme.border))
+            .child(resize_handle(cx, theme, ResizeTarget::FolderTree))
             .child(self.file_list(cx));
         if !self.preview_collapsed {
             row = row
-                .child(div().w(px(1.0)).bg(theme.border))
+                .child(resize_handle(cx, theme, ResizeTarget::Preview))
                 .child(self.preview_pane());
         }
         row.into_any_element()
@@ -2965,6 +3260,12 @@ impl Root {
                 .py_1()
                 .bg(self.theme.surface0)
                 .rounded_sm()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_this, _event, _window, cx| {
+                        cx.stop_propagation();
+                    }),
+                )
                 .child(self.input_field(cx, self.tr("输入路径...")))
                 .into_any_element()
         } else {
@@ -2979,13 +3280,91 @@ impl Root {
                 .text_sm()
                 .id("addr-bar")
                 .cursor_pointer()
-                .child("⌂")
                 .child(cwd)
                 .on_click(cx.listener(|this, _event, window, cx| {
                     this.start_goto(window, cx);
                 }))
                 .into_any_element()
         }
+    }
+
+    fn titlebar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = self.theme;
+        div()
+            .w_full()
+            .h(px(34.0))
+            .flex()
+            .items_center()
+            .bg(theme.base)
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .w(px(38.0))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .flex_shrink_0()
+                    .text_sm()
+                    .text_color(theme.blue)
+                    .child(
+                        svg()
+                            .path(Self::application_icon_path())
+                            .w(px(18.0))
+                            .h(px(18.0))
+                            .flex_shrink_0(),
+                    ),
+            )
+            .child(
+                div()
+                    .h_full()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .px_2()
+                    .cursor(CursorStyle::OpenHand)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _event, window, cx| {
+                            this.begin_window_move(window, cx);
+                        }),
+                    )
+                    .child(div().text_sm().child("yazi-gui")),
+            )
+            .child(window_control_button(
+                cx,
+                theme,
+                "titlebar-settings",
+                "⚙",
+                self.tr("设置"),
+                |this, _window, cx| this.show_settings(cx),
+            ))
+            .child(window_control_button(
+                cx,
+                theme,
+                "titlebar-minimize",
+                "−",
+                self.tr("最小化"),
+                |this, window, cx| this.minimize_window(window, cx),
+            ))
+            .child(window_control_button(
+                cx,
+                theme,
+                "titlebar-maximize",
+                "□",
+                self.tr("最大化"),
+                |this, window, cx| this.toggle_maximize(window, cx),
+            ))
+            .child(window_control_button(
+                cx,
+                theme,
+                "titlebar-close",
+                "×",
+                self.tr("关闭"),
+                |this, window, cx| this.request_close(window, cx),
+            ))
+            .into_any_element()
     }
 
     fn tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3007,7 +3386,7 @@ impl Root {
                 });
                 tab_button(cx, theme, i, name, active)
             }))
-            .child(new_tab_button(cx, theme))
+            .child(new_tab_button(cx, theme, self.language()))
     }
 
     fn context_menu(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -3230,6 +3609,11 @@ impl Render for Root {
         } else {
             "☆"
         };
+        let favorite_tooltip = if !computer_view && self.is_favorite(&self.cur().cwd) {
+            self.tr("取消收藏当前目录")
+        } else {
+            self.tr("收藏当前目录")
+        };
         let action_row = div()
             .w_full()
             .px_4()
@@ -3240,7 +3624,7 @@ impl Render for Root {
             .flex()
             .items_center()
             .gap_2()
-            .child(command_button(
+            .child(icon_button(
                 cx,
                 theme,
                 "btn-open",
@@ -3248,7 +3632,7 @@ impl Render for Root {
                 self.tr("打开"),
                 |this, _w, cx| this.open_selected(cx),
             ))
-            .child(command_button(
+            .child(icon_button(
                 cx,
                 theme,
                 "btn-delete",
@@ -3256,7 +3640,7 @@ impl Render for Root {
                 self.tr("删除"),
                 |this, _w, cx| this.delete_selected(cx),
             ))
-            .child(command_button(
+            .child(icon_button(
                 cx,
                 theme,
                 "btn-rename",
@@ -3264,7 +3648,7 @@ impl Render for Root {
                 self.tr("重命名"),
                 |this, w, cx| this.start_rename(w, cx),
             ))
-            .child(command_button(
+            .child(icon_button(
                 cx,
                 theme,
                 "btn-yank",
@@ -3272,7 +3656,7 @@ impl Render for Root {
                 self.tr("复制"),
                 |this, _w, cx| this.copy_selected(cx),
             ))
-            .child(command_button(
+            .child(icon_button(
                 cx,
                 theme,
                 "btn-cut",
@@ -3280,7 +3664,7 @@ impl Render for Root {
                 self.tr("剪切"),
                 |this, _w, cx| this.cut_selected(cx),
             ))
-            .child(command_button(
+            .child(icon_button(
                 cx,
                 theme,
                 "btn-paste",
@@ -3289,28 +3673,28 @@ impl Render for Root {
                 |this, _w, cx| this.paste_clipboard(cx),
             ))
             .child(toolbar_divider(theme))
-            .child(command_button(
+            .child(icon_button(
                 cx,
                 theme,
                 "btn-newfile",
-                "＋",
+                "📄+",
                 self.tr("新建文件"),
                 |this, w, cx| this.start_new_file(w, cx),
             ))
-            .child(command_button(
+            .child(icon_button(
                 cx,
                 theme,
                 "btn-newdir",
-                "＋",
+                "📁+",
                 self.tr("新建文件夹"),
                 |this, w, cx| this.start_new_dir(w, cx),
             ))
             .child(toolbar_divider(theme))
-            .child(command_button(
+            .child(icon_button(
                 cx,
                 theme,
                 "btn-preview-toggle",
-                "▣",
+                "◫",
                 self.tr(if self.preview_collapsed {
                     "展开预览"
                 } else {
@@ -3318,16 +3702,7 @@ impl Render for Root {
                 }),
                 |this, _w, cx| this.toggle_preview(cx),
             ))
-            .child(div().flex_1())
-            .child(self.file_search_field(cx))
-            .child(command_button(
-                cx,
-                theme,
-                "btn-settings",
-                "⚙",
-                self.tr("设置"),
-                |this, _w, cx| this.show_settings(cx),
-            ));
+            .child(div().flex_1());
 
         div()
             .size_full()
@@ -3337,9 +3712,19 @@ impl Render for Root {
             .text_color(theme.text)
             .id("root")
             .track_focus(&focus_handle)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event, _window, cx| {
+                    if matches!(this.pending, Some(PendingOp::GoToPath | PendingOp::Search)) {
+                        this.cancel_input_state();
+                        cx.notify();
+                    }
+                }),
+            )
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.on_input_key(event, window, cx);
             }))
+            .child(self.titlebar(cx))
             .child(self.tab_bar(cx))
             .child(
                 div()
@@ -3352,17 +3737,20 @@ impl Render for Root {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(self.address_bar(cx, cwd))
-                    .child(action_button(
+                    .child(parent_button(cx, theme, self.language()))
+                    .child(refresh_button(cx, theme, self.language()))
+                    .child(computer_button(cx, theme, self.language()))
+                    .child(icon_button(
                         cx,
                         theme,
                         "btn-favorite-current",
                         favorite_label,
+                        favorite_tooltip,
                         |this, _w, cx| this.toggle_current_favorite(cx),
                     ))
-                    .child(refresh_button(cx, theme, self.language()))
-                    .child(parent_button(cx, theme, self.language()))
-                    .child(computer_button(cx, theme, self.language())),
+                    .child(self.address_bar(cx, cwd))
+                    .child(div().flex_1())
+                    .child(self.file_search_field(cx)),
             )
             .child(self.favorites_bar(cx))
             .child(action_row)
@@ -3854,10 +4242,7 @@ fn main() {
                 window_bounds: Some(WindowBounds::centered(size(px(1000.0), px(650.0)), cx)),
                 show: !background,
                 focus: !background,
-                titlebar: Some(TitlebarOptions {
-                    title: Some("yazi-gui".into()),
-                    ..Default::default()
-                }),
+                titlebar: None,
                 ..Default::default()
             },
             |window, cx| {
@@ -3870,7 +4255,10 @@ fn main() {
                     let focus_handle = root.focus_handle.clone();
                     root.input_blur_subscription =
                         Some(cx.on_blur(&focus_handle, window, |this, _window, cx| {
-                            if this.is_inline_editing() {
+                            if matches!(this.pending, Some(PendingOp::GoToPath)) {
+                                this.cancel_input_state();
+                                cx.notify();
+                            } else if this.is_inline_editing() {
                                 this.confirm_input(cx);
                             }
                         }));
@@ -3890,12 +4278,13 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        DeleteSummary, FileEntry, SortDirection, SortField, SortState, TransferOutcome,
+        DeleteSummary, FileEntry, LayoutState, MODIFIED_WIDTH_MIN, PREVIEW_WIDTH_MAX, ResizeTarget,
+        SortDirection, SortField, SortState, TREE_WIDTH_MIN, TransferOutcome, clamp_layout_width,
         copy_paths_with_progress, delete_status, favorite_path_key, format_mtime,
-        is_primary_yazi_tab, is_unc_path, keystroke_to_shortcut, normalize_favorite_path,
-        normalize_shortcut, normalize_single_path, permanent_delete, reconcile_selection,
-        refresh_request_matches, refresh_token_matches, resolve_address_path, scan_folder_children,
-        search_directory, sort_files, tree_ancestor_paths, tree_path_key,
+        horizontal_scrollbar_metrics, is_primary_yazi_tab, is_unc_path, keystroke_to_shortcut,
+        normalize_favorite_path, normalize_shortcut, normalize_single_path, permanent_delete,
+        reconcile_selection, refresh_request_matches, refresh_token_matches, resolve_address_path,
+        scan_folder_children, search_directory, sort_files, tree_ancestor_paths, tree_path_key,
     };
     use std::fs;
     use std::sync::atomic::AtomicBool;
@@ -4230,5 +4619,33 @@ mod tests {
                 .any(|result| result.name == "NestedFolder\\Report.TXT")
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn layout_widths_have_drag_bounds() {
+        let layout = LayoutState::default();
+        assert_eq!(layout.tree_width, 240.0);
+        assert_eq!(layout.name_width, 360.0);
+        assert!(layout.file_list_min_width() > layout.name_width);
+        assert_eq!(
+            clamp_layout_width(ResizeTarget::FolderTree, 1.0),
+            TREE_WIDTH_MIN
+        );
+        assert_eq!(
+            clamp_layout_width(ResizeTarget::Preview, 999.0),
+            PREVIEW_WIDTH_MAX
+        );
+        assert_eq!(
+            clamp_layout_width(ResizeTarget::ModifiedColumn, 1.0),
+            MODIFIED_WIDTH_MIN
+        );
+    }
+
+    #[test]
+    fn horizontal_scrollbar_has_no_thumb_without_overflow() {
+        assert_eq!(horizontal_scrollbar_metrics(640.0, 0.0), None);
+        let (thumb, travel) = horizontal_scrollbar_metrics(640.0, 640.0).unwrap();
+        assert_eq!(thumb, 320.0);
+        assert_eq!(travel, 320.0);
     }
 }

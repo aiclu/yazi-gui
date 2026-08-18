@@ -54,22 +54,145 @@ pub(crate) fn tab_button(
         .into_any_element()
 }
 
-pub(crate) fn new_tab_button(cx: &mut Context<Root>, theme: Theme) -> impl IntoElement {
+struct TooltipView {
+    text: SharedString,
+    theme: Theme,
+}
+
+impl Render for TooltipView {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .bg(self.theme.crust)
+            .border_1()
+            .border_color(self.theme.border)
+            .rounded_sm()
+            .text_xs()
+            .text_color(self.theme.text)
+            .child(self.text.clone())
+    }
+}
+
+pub(crate) fn icon_button(
+    cx: &mut Context<Root>,
+    theme: Theme,
+    id: &'static str,
+    icon: impl Into<SharedString>,
+    tooltip: impl Into<SharedString>,
+    on_click: impl Fn(&mut Root, &mut Window, &mut Context<Root>) + 'static,
+) -> impl IntoElement {
+    let tooltip = tooltip.into();
     div()
-        .px_2()
-        .py_1()
+        .w(px(32.0))
+        .h(px(30.0))
+        .flex()
+        .items_center()
+        .justify_center()
         .bg(theme.surface0)
         .border_1()
         .border_color(theme.border)
-        .rounded_md()
+        .rounded_sm()
         .cursor_pointer()
-        .text_sm()
+        .text_base()
+        .child(icon.into())
+        .id(id)
         .hover(|style| style.bg(theme.hover))
-        .child("+")
-        .id("btn-new-tab")
-        .on_click(cx.listener(|this, _e, _w, cx| {
-            this.new_tab(cx);
+        .tooltip(move |_window, cx| {
+            cx.new(|_| TooltipView {
+                text: tooltip.clone(),
+                theme,
+            })
+            .into()
+        })
+        .on_click(cx.listener(move |this, _event, window, cx| {
+            on_click(this, window, cx);
+            cx.stop_propagation();
         }))
+}
+
+pub(crate) fn window_control_button(
+    cx: &mut Context<Root>,
+    theme: Theme,
+    id: &'static str,
+    icon: &'static str,
+    tooltip: impl Into<SharedString>,
+    on_click: impl Fn(&mut Root, &mut Window, &mut Context<Root>) + 'static,
+) -> impl IntoElement {
+    let tooltip = tooltip.into();
+    div()
+        .w(px(46.0))
+        .h_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_base()
+        .text_color(theme.text)
+        .id(id)
+        .hover(|style| style.bg(theme.hover))
+        .tooltip(move |_window, cx| {
+            cx.new(|_| TooltipView {
+                text: tooltip.clone(),
+                theme,
+            })
+            .into()
+        })
+        .on_click(cx.listener(move |this, _event, window, cx| {
+            on_click(this, window, cx);
+            cx.stop_propagation();
+        }))
+        .child(icon)
+}
+
+pub(crate) fn resize_handle(
+    cx: &Context<Root>,
+    theme: Theme,
+    target: ResizeTarget,
+) -> impl IntoElement {
+    div()
+        .w(px(6.0))
+        .h_full()
+        .flex_shrink_0()
+        .bg(theme.border)
+        .cursor(CursorStyle::ResizeLeftRight)
+        .hover(|style| style.bg(theme.blue))
+        .id(SharedString::from(format!("resize-{target:?}")))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                this.begin_resize(target, f32::from(event.position.x), cx);
+                cx.stop_propagation();
+            }),
+        )
+        .on_mouse_up_out(
+            MouseButton::Left,
+            cx.listener(|this, _event, _window, cx| this.end_resize(cx)),
+        )
+        .on_drag(target, |_target: &ResizeTarget, _position, _window, cx| {
+            cx.new(|_| ResizeGhost)
+        })
+        .on_drag_move(cx.listener(
+            move |this, event: &DragMoveEvent<ResizeTarget>, _window, cx| {
+                this.resize_layout(f32::from(event.event.position.x), cx);
+            },
+        ))
+}
+
+pub(crate) fn new_tab_button(
+    cx: &mut Context<Root>,
+    theme: Theme,
+    language: Language,
+) -> impl IntoElement {
+    icon_button(
+        cx,
+        theme,
+        "btn-new-tab",
+        "+",
+        settings::translate(language, "新建标签页"),
+        |this, _window, cx| {
+            this.new_tab(cx);
+        },
+    )
 }
 
 pub(crate) fn refresh_button(
@@ -77,21 +200,16 @@ pub(crate) fn refresh_button(
     theme: Theme,
     language: Language,
 ) -> impl IntoElement {
-    div()
-        .px_2()
-        .py_1()
-        .bg(theme.surface0)
-        .border_1()
-        .border_color(theme.border)
-        .rounded_md()
-        .cursor_pointer()
-        .text_sm()
-        .child(settings::translate(language, "刷新"))
-        .id("btn-refresh")
-        .hover(|style| style.bg(theme.hover))
-        .on_click(cx.listener(|this, _event, _window, cx| {
+    icon_button(
+        cx,
+        theme,
+        "btn-refresh",
+        "↻",
+        settings::translate(language, "刷新"),
+        |this, _window, cx| {
             this.refresh_current(cx);
-        }))
+        },
+    )
 }
 
 pub(crate) fn parent_button(
@@ -99,21 +217,16 @@ pub(crate) fn parent_button(
     theme: Theme,
     language: Language,
 ) -> impl IntoElement {
-    div()
-        .px_2()
-        .py_1()
-        .bg(theme.surface0)
-        .border_1()
-        .border_color(theme.border)
-        .rounded_md()
-        .cursor_pointer()
-        .text_sm()
-        .child(settings::translate(language, "上级 .."))
-        .id("btn-parent")
-        .hover(|style| style.bg(theme.hover))
-        .on_click(cx.listener(|this, _event, _window, cx| {
+    icon_button(
+        cx,
+        theme,
+        "btn-parent",
+        "↑",
+        settings::translate(language, "上级"),
+        |this, _window, cx| {
             this.go_parent(cx);
-        }))
+        },
+    )
 }
 
 pub(crate) fn computer_button(
@@ -121,21 +234,16 @@ pub(crate) fn computer_button(
     theme: Theme,
     language: Language,
 ) -> impl IntoElement {
-    div()
-        .px_2()
-        .py_1()
-        .bg(theme.surface0)
-        .border_1()
-        .border_color(theme.border)
-        .rounded_md()
-        .cursor_pointer()
-        .text_sm()
-        .child(settings::translate(language, "此电脑"))
-        .id("btn-computer")
-        .hover(|style| style.bg(theme.hover))
-        .on_click(cx.listener(|this, _event, _window, cx| {
+    icon_button(
+        cx,
+        theme,
+        "btn-computer",
+        "🖥",
+        settings::translate(language, "此电脑"),
+        |this, _window, cx| {
             this.show_computer_view(cx);
-        }))
+        },
+    )
 }
 
 pub(crate) fn action_button(
@@ -154,35 +262,6 @@ pub(crate) fn action_button(
         .rounded_md()
         .cursor_pointer()
         .text_sm()
-        .child(label.into())
-        .id(id)
-        .hover(|style| style.bg(theme.hover))
-        .on_click(cx.listener(move |this, _event, window, cx| {
-            on_click(this, window, cx);
-        }))
-}
-
-pub(crate) fn command_button(
-    cx: &mut Context<Root>,
-    theme: Theme,
-    id: &'static str,
-    icon: &'static str,
-    label: impl Into<SharedString>,
-    on_click: impl Fn(&mut Root, &mut Window, &mut Context<Root>) + 'static,
-) -> impl IntoElement {
-    div()
-        .px_2()
-        .py_1()
-        .bg(theme.base)
-        .border_1()
-        .border_color(theme.border)
-        .rounded_sm()
-        .cursor_pointer()
-        .flex()
-        .items_center()
-        .gap_1()
-        .text_sm()
-        .child(div().text_base().child(icon))
         .child(label.into())
         .id(id)
         .hover(|style| style.bg(theme.hover))
@@ -379,7 +458,6 @@ pub(crate) fn sort_header(
     label: impl Into<SharedString>,
     field: SortField,
     sort: SortState,
-    flexible: bool,
     width: f32,
 ) -> AnyElement {
     let label: SharedString = label.into();
@@ -392,27 +470,31 @@ pub(crate) fn sort_header(
     } else {
         ""
     };
-    let mut element = div()
+    div()
+        .w(px(width))
+        .flex_shrink_0()
         .cursor_pointer()
         .text_xs()
+        .whitespace_nowrap()
+        .overflow_hidden()
         .text_color(if active { theme.text } else { theme.muted })
         .id(SharedString::from(format!("sort-{:?}", field)))
         .on_click(cx.listener(move |this, _event, _window, cx| {
             this.toggle_sort(field, cx);
             cx.stop_propagation();
         }))
-        .child(SharedString::from(format!("{}{}", label, arrow)));
-    if flexible {
-        element = element.flex_1();
-    } else {
-        element = element.w(px(width));
-    }
-    element.into_any_element()
+        .child(SharedString::from(format!("{}{}", label, arrow)))
+        .into_any_element()
+}
+
+fn column_spacer() -> impl IntoElement {
+    div().w(px(6.0)).flex_shrink_0()
 }
 
 pub(crate) fn file_row(
     cx: &mut Context<Root>,
     theme: Theme,
+    layout: LayoutState,
     name: String,
     is_dir: bool,
     size: u64,
@@ -449,15 +531,20 @@ pub(crate) fn file_row(
     };
     let name_cell = if let Some(input) = inline_input {
         div()
-            .flex_1()
+            .w(px(layout.name_width))
+            .flex_shrink_0()
             .px_1()
             .bg(theme.surface0)
             .rounded_sm()
             .child(input)
     } else {
         div()
-            .flex_1()
+            .w(px(layout.name_width))
+            .flex_shrink_0()
             .text_sm()
+            .whitespace_nowrap()
+            .overflow_hidden()
+            .text_ellipsis()
             .text_color(name_color)
             .child(display)
     };
@@ -467,8 +554,7 @@ pub(crate) fn file_row(
         .px_3()
         .py_1()
         .flex()
-        .justify_between()
-        .gap_3()
+        .gap_0()
         .bg(if selected { theme.selected } else { theme.base })
         .cursor_pointer()
         .id(SharedString::from(row_id));
@@ -496,18 +582,28 @@ pub(crate) fn file_row(
             );
     }
     row.child(name_cell)
+        .child(column_spacer())
         .child(
             div()
-                .w(px(135.0))
+                .w(px(layout.modified_width))
+                .flex_shrink_0()
                 .text_xs()
+                .whitespace_nowrap()
+                .overflow_hidden()
                 .text_color(theme.muted)
                 .child(modified),
         )
+        .child(column_spacer())
         .child(
             div()
-                .w(px(80.0))
+                .w(px(layout.size_width))
+                .flex_shrink_0()
                 .text_xs()
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .text_right()
                 .text_color(theme.muted)
                 .child(meta),
         )
+        .child(column_spacer())
 }

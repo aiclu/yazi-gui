@@ -11,6 +11,8 @@
 - Multi-tab navigation, directory-first listings, and sorting by name, modified time, or size.
 - Address navigation, recursive search, and inline filename editing for rename/create operations.
 - File previews, syntax highlighting, image previews, and local-time modified timestamps.
+- Resizable folder tree, file columns, and preview panel with aligned name, modified, and size data.
+- Win11-style custom titlebar and icon-only file commands with localized hover tooltips.
 - Copy, cut, and paste with byte-level copy progress and block-boundary cancellation.
 - Computer View for drives, refresh, Windows Recycle Bin handling, and confirmation-based permanent deletion on network drives.
 - Theme, language, shortcut, autostart, tray, about, and manual update settings.
@@ -71,6 +73,8 @@ The Settings page can check the latest stable GitHub Release for the matching pa
 - 多标签页、目录优先列表、按名称/修改时间/大小排序。
 - 地址栏跳转、递归文件搜索、文件名行内重命名与新建。
 - 文件预览、语法高亮、图片预览，以及本地时间格式的修改时间。
+- 文件夹树、文件列和预览面板可拖拽调整宽度，名称/修改时间/大小保持对齐。
+- Win11 风格自定义标题栏，文件操作按钮使用图标并在悬停时显示本地化提示。
 - 复制/剪切/粘贴；复制显示字节级进度，可在块边界取消。
 - “此电脑”磁盘视图、刷新、Windows 回收站和网络驱动器永久删除确认。
 - 主题、语言、快捷键、自启动、托盘、关于和手动更新设置。

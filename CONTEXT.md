@@ -8,6 +8,22 @@ This glossary defines the user-facing concepts used by the graphical file manage
 The tab whose directory, selection, and preview are currently shown.
 _Avoid_: current window, selected page
 
+**Workspace State**:
+The runtime state coordinated by the main window, including GUI tabs, shared file-operation state, settings, and tray state.
+_Avoid_: global model, window cache
+
+**GUI Tab**:
+An independent local file view with its own directory snapshot, selection, sorting, search session, preview, and asynchronous request state.
+_Avoid_: yazi tab, process tab
+
+**Yazi Session**:
+The single yazi backend process shared by GUI tabs. GUI tabs are local views over this session and accept events only for their current directory.
+_Avoid_: one process per tab, protocol bridge state
+
+**Operation Token**:
+A per-view marker attached to an asynchronous scan or refresh request. A result whose token is no longer current is ignored.
+_Avoid_: retry counter, progress percentage
+
 **Address Path**:
 The directory path used to identify and navigate the active tab's location.
 _Avoid_: URL, location string
@@ -16,6 +32,18 @@ _Avoid_: URL, location string
 The virtual top-level view that lists available drive roots before entering a directory.
 _Avoid_: desktop, root directory
 
+**Folder Tree**:
+A hierarchical navigation view of real folders below Computer View, drive roots, and their child folders.
+_Avoid_: file tree, global folder index
+
+**Favorite Folder**:
+A user-pinned real folder path, including a drive root or UNC folder, that can be opened from the Favorites Bar.
+_Avoid_: bookmark, shortcut
+
+**Favorites Bar**:
+The horizontal list of Favorite Folders below the Address Path, kept in the order the user added them.
+_Avoid_: recent folders, history
+
 **Sort State**:
 The field and direction used to order entries in an active tab's file list.
 _Avoid_: yazi sort mode, list preference
@@ -23,6 +51,30 @@ _Avoid_: yazi sort mode, list preference
 **Preview**:
 The content summary shown for the currently selected file or directory.
 _Avoid_: detail pane, inspector
+
+**Preview Panel**:
+The optional right-side surface that displays the Preview for the active selection.
+_Avoid_: inspector pane, details sidebar
+
+**Resizable Pane**:
+A visible boundary whose drag changes the width of the Folder Tree, file list columns, or Preview Panel for the current session.
+_Avoid_: persisted layout profile, responsive breakpoint
+
+**File Column Layout**:
+The shared Name, Modified, and Size column widths used by both the list header and every file row. The three columns stay inside one file-list horizontal viewport; its bottom scrollbar moves the header and rows together, while the ordinary wheel remains vertical.
+_Avoid_: independent row alignment, floating metadata
+
+**Application Titlebar**:
+The custom top strip containing the SVG application identity, Settings control, native window controls, and the Windows non-client drag bridge.
+_Avoid_: toolbar, external window chrome
+
+**Command Tooltip**:
+The localized label shown when the pointer rests on an icon-only command button.
+_Avoid_: hidden command name, text toolbar label
+
+**File Search Field**:
+The always-visible file-page input that searches the active real directory by name or relative path.
+_Avoid_: address input
 
 **Refresh Operation**:
 The active-tab action that sends yazi's `cd <current directory>` action asynchronously, completes when yazi accepts the command, and applies the resulting `gui-files` snapshot when it arrives; in Computer View it rescans drive roots in the background.
@@ -33,15 +85,31 @@ A per-tab in-flight refresh marker tied to the requested directory. It prevents 
 _Avoid_: permanent loading state, synchronous reload
 
 **Settings Page**:
-The in-window page for theme, language, shortcuts, autostart, about information, and the explicitly unconfigured update entry.
+The in-window page for theme, language, shortcuts, autostart, about information, and manual release updates.
 _Avoid_: preferences dialog, external settings window
+
+**Update Check**:
+A manual request for the latest stable Windows release that matches the current package type.
+_Avoid_: startup polling, arbitrary update source
+
+**Update Download**:
+A cancellable transfer of the matching release package that is accepted only after its published checksum is verified.
+_Avoid_: unverified installer, background update
+
+**System Proxy**:
+The Windows proxy behavior used by update requests, including automatic configuration selected by the current user or system.
+_Avoid_: app-specific proxy setting, direct-only request
+
+**Restart Update**:
+The explicit action that closes the current GUI, applies a verified package, and starts the updated version.
+_Avoid_: silent update, self-overwrite
 
 **Tray State**:
 The Windows notification-area icon that restores the window on left click and exposes show, settings, and exit on the context menu.
 _Avoid_: background service, hidden process
 
 **Search Session**:
-The transient recursive search mode for the active real directory. Its query, generation, and results are discarded when the user navigates, switches tabs, or presses Escape.
+The recursive result state created by the File Search Field for the active real directory. Its query, generation, and results are cleared when the field is emptied or the user navigates or switches tabs.
 _Avoid_: global index, system-wide search
 
 **Search Result**:
@@ -49,6 +117,10 @@ A relative path returned by a Search Session. It keeps the existing file-row beh
 _Avoid_: virtual file, copied path
 
 ## File Operations
+
+**File Operation**:
+A background filesystem action such as search, copy, delete, or directory scan with an explicit result and user-visible status.
+_Avoid_: service task, command queue
 
 **File Clipboard**:
 The set of selected filesystem entries held for a later copy or cut paste operation.

@@ -1,6 +1,6 @@
 [package]
 name = "yazi-gui"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "A native GUI for the yazi terminal file manager, powered by GPUI and yazi's DDS event stream."
 
@@ -20,9 +20,13 @@ syntect = { version = "5", default-features = false, features = ["default-fancy"
 time = { version = "0.3.55", features = ["formatting", "local-offset", "macros"] }
 unicode-segmentation = "1"
 raw-window-handle = "0.6.2"
+semver = "1"
+sha2 = "0.10"
+url = "2"
+zip = { version = "4", default-features = false, features = ["deflate"] }
 
 [build-dependencies]
 embed-resource = "3.0.11"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_WindowsProgramming", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Gdi", "Win32_Networking_WinHttp", "Win32_Storage_FileSystem", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }

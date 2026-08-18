@@ -35,8 +35,10 @@ jobs:
           $zip = Join-Path $env:GITHUB_WORKSPACE "dist\yazi-gui-$env:RELEASE_TAG-windows-x64.zip"
           New-Item -ItemType Directory -Force $stage | Out-Null
           New-Item -ItemType Directory -Force (Join-Path $stage "assets") | Out-Null
+          New-Item -ItemType Directory -Force (Join-Path $stage "assets\icons") | Out-Null
           Copy-Item "target\release\yazi-gui.exe" $stage
           Copy-Item "assets\yazi" (Join-Path $stage "assets\yazi") -Recurse
+          Copy-Item "assets\icons\yazi-gui.svg" (Join-Path $stage "assets\icons\yazi-gui.svg")
           Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip -Force
 
       - name: Build bundled-yazi binary
@@ -65,9 +67,11 @@ jobs:
           $zip = Join-Path $env:GITHUB_WORKSPACE "dist\yazi-gui-$env:RELEASE_TAG-windows-x64-bundled-yazi-$env:YAZI_VERSION.zip"
           New-Item -ItemType Directory -Force $stage | Out-Null
           New-Item -ItemType Directory -Force (Join-Path $stage "assets") | Out-Null
+          New-Item -ItemType Directory -Force (Join-Path $stage "assets\icons") | Out-Null
           New-Item -ItemType Directory -Force (Join-Path $stage "THIRD_PARTY_LICENSES") | Out-Null
           Copy-Item "target\release\yazi-gui.exe" $stage
           Copy-Item "assets\yazi" (Join-Path $stage "assets\yazi") -Recurse
+          Copy-Item "assets\icons\yazi-gui.svg" (Join-Path $stage "assets\icons\yazi-gui.svg")
           Copy-Item (Join-Path $env:YAZI_EXTRACT "yazi.exe") $stage
           Copy-Item (Join-Path $env:YAZI_EXTRACT "ya.exe") $stage
           Copy-Item (Join-Path $env:YAZI_EXTRACT "LICENSE") (Join-Path $stage "THIRD_PARTY_LICENSES\yazi-LICENSE.txt")

@@ -97,6 +97,7 @@ pub struct AppSettings {
     pub theme: ThemeMode,
     pub language: Language,
     pub shortcuts: ShortcutSettings,
+    pub favorites: Vec<String>,
     /// Deliberately false: first launch must not alter Windows startup behavior.
     pub autostart: bool,
 }
@@ -107,6 +108,7 @@ impl Default for AppSettings {
             theme: ThemeMode::Dark,
             language: Language::System,
             shortcuts: ShortcutSettings::default(),
+            favorites: Vec::new(),
             autostart: false,
         }
     }
@@ -248,6 +250,12 @@ pub fn translate(language: Language, text: &str) -> String {
             "Refreshing; finish it before exiting".to_string()
         }
         "上级 .." => "Parent ..".to_string(),
+        "上级" => "Parent".to_string(),
+        "收藏当前目录" => "Favorite current folder".to_string(),
+        "取消收藏当前目录" => "Remove current folder favorite".to_string(),
+        "最小化" => "Minimize".to_string(),
+        "最大化" => "Maximize".to_string(),
+        "关闭" => "Close".to_string(),
         "打开" => "Open".to_string(),
         "搜索" => "Search".to_string(),
         "删除" => "Delete".to_string(),
@@ -260,6 +268,14 @@ pub fn translate(language: Language, text: &str) -> String {
         "新建标签页" => "New tab".to_string(),
         "关闭标签页" => "Close tab".to_string(),
         "设置" => "Settings".to_string(),
+        "收藏" => "Favorite".to_string(),
+        "取消收藏" => "Remove favorite".to_string(),
+        "收藏夹为空" => "No favorite folders".to_string(),
+        "路径不可用" => "Path unavailable".to_string(),
+        "此电脑视图不可收藏" => "Computer View cannot be favorited".to_string(),
+        "文件夹树" => "Folder tree".to_string(),
+        "展开预览" => "Show preview".to_string(),
+        "折叠预览" => "Hide preview".to_string(),
         "名称" => "Name".to_string(),
         "修改时间" => "Modified".to_string(),
         "大小" => "Size".to_string(),
@@ -283,6 +299,26 @@ pub fn translate(language: Language, text: &str) -> String {
         "确认永久删除" => "Confirm permanent delete".to_string(),
         "正在复制" => "Preparing copy".to_string(),
         "检查更新" => "Check for updates".to_string(),
+        "再次检查" => "Check again".to_string(),
+        "重新检查" => "Check again".to_string(),
+        "应用更新" => "App update".to_string(),
+        "应用外观、行为和更新" => "Manage appearance, behavior, and updates".to_string(),
+        "正在检查更新..." => "Checking for updates...".to_string(),
+        "检查更新失败" => "Update check failed".to_string(),
+        "已是最新版本" => "Up to date".to_string(),
+        "发现新版本" => "New version available".to_string(),
+        "下载更新" => "Download update".to_string(),
+        "打开发布页" => "Open release page".to_string(),
+        "正在下载更新" => "Downloading update".to_string(),
+        "取消下载" => "Cancel download".to_string(),
+        "下载完成" => "Download complete".to_string(),
+        "下载完成，可重启更新" => "Download complete; restart to update".to_string(),
+        "重启完成更新" => "Restart to update".to_string(),
+        "正在重启完成更新..." => "Restarting to apply update...".to_string(),
+        "下载已取消" => "Download cancelled".to_string(),
+        "下载更新失败" => "Update download failed".to_string(),
+        "正在取消下载" => "Cancelling download".to_string(),
+        "启动更新失败" => "Failed to start update".to_string(),
         "关于" => "About".to_string(),
         "主题" => "Theme".to_string(),
         "语言" => "Language".to_string(),
@@ -302,12 +338,16 @@ pub fn translate(language: Language, text: &str) -> String {
         "按下快捷键..." => "Press a shortcut...".to_string(),
         "清除快捷键" => "Clear shortcut".to_string(),
         "输入搜索..." => "Search...".to_string(),
+        "搜索文件..." => "Search files...".to_string(),
+        "加载文件夹..." => "Loading folder...".to_string(),
+        "无法读取: " => "Cannot read: ".to_string(),
+        "展开" => "Expand".to_string(),
+        "收起" => "Collapse".to_string(),
         "搜索中..." => "Searching...".to_string(),
         "搜索失败" => "Search failed".to_string(),
         "搜索仅支持真实目录" => "Search is only available in a real directory".to_string(),
         "设置文件无效" => "Settings file is invalid".to_string(),
         "当前版本" => "Current version".to_string(),
-        "未配置更新源" => "No update source configured".to_string(),
         "关闭窗口时隐藏到托盘" => "Closing the window hides it to the tray".to_string(),
         "自启动默认关闭" => "Startup is disabled by default".to_string(),
         "保存失败" => "Save failed".to_string(),
@@ -342,6 +382,14 @@ pub fn translate_status(language: Language, text: &str) -> String {
         ("跳转失败: ", "Navigation failed: "),
         ("刷新失败: ", "Refresh failed: "),
         ("搜索失败: ", "Search failed: "),
+        ("发现新版本: ", "New version available: "),
+        ("已是最新版本: ", "Up to date: "),
+        (
+            "下载完成，可重启更新",
+            "Download complete; restart to update",
+        ),
+        ("下载更新失败: ", "Update download failed: "),
+        ("启动更新失败: ", "Failed to start update: "),
     ] {
         if let Some(rest) = text.strip_prefix(prefix) {
             return format!("{}{}", replacement, translate_status(language, rest));
@@ -371,6 +419,7 @@ mod tests {
         let json = serde_json::to_string(&settings).unwrap();
         let decoded: AppSettings = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, settings);
+        assert!(decoded.favorites.is_empty());
     }
 
     #[test]
@@ -393,6 +442,13 @@ mod tests {
             "autostart":false
         }"#;
         assert!(serde_json::from_str::<AppSettings>(json).is_err());
+    }
+
+    #[test]
+    fn settings_without_favorites_are_rejected() {
+        let mut value = serde_json::to_value(AppSettings::default()).unwrap();
+        value.as_object_mut().unwrap().remove("favorites");
+        assert!(serde_json::from_value::<AppSettings>(value).is_err());
     }
 
     #[test]

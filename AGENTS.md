@@ -2,9 +2,14 @@
 
 ## Project Structure & Module Organization
 
-- `src/main.rs` contains the GPUI application, tabs, selection, previews, themes, and file operations.
+- `src/main.rs` contains the GPUI application shell, event coordination, navigation, and shared operation state.
+- `src/workspace.rs` owns tab state, sorting, search/preview state, and folder-tree state transitions.
+- `src/fs_ops.rs` owns filesystem scans, copy/delete workers, progress results, and path policies.
+- `src/ui/` contains input rendering, reusable components, the file page, and the settings page.
 - `src/yazi.rs` owns the yazi subprocess bridge, event parsing, and `ya emit-to` commands.
 - `src/settings.rs` and `src/tray.rs` own settings persistence and the Windows tray bridge.
+- `src/update.rs` owns manual GitHub release checks, system-proxy downloads, checksum verification, and restart application.
+- `scripts/stage-bundled-yazi.ps1` explicitly stages the fixed yazi package for local bundled-build testing.
 - `assets/yazi/` contains the runtime yazi configuration and the `gui-files.yazi` plugin that publishes directory state.
 - `.github/workflows/release.yml` builds the two Windows release packages from `v*` tags.
 - `docs/adr/` records architecture decisions; `assets/icons/` contains application icon sources.
@@ -26,7 +31,7 @@ Install Rust with edition 2024 support, and make both `yazi` and `ya` available 
 
 ## Coding Style & Naming Conventions
 
-Use standard `rustfmt` formatting with four-space indentation. Follow Rust naming conventions: `snake_case` for functions and modules, `CamelCase` for types, and `SCREAMING_SNAKE_CASE` for constants. Keep yazi protocol/process code in `src/yazi.rs`; keep UI state and rendering in `src/main.rs`. Prefer `Result`-based error handling for subprocess and filesystem operations, and run `cargo fmt --all` before committing.
+Use standard `rustfmt` formatting with four-space indentation. Follow Rust naming conventions: `snake_case` for functions and modules, `CamelCase` for types, and `SCREAMING_SNAKE_CASE` for constants. Keep yazi protocol/process code in `src/yazi.rs`; keep filesystem side effects in `src/fs_ops.rs`, tab/domain state in `src/workspace.rs`, and page rendering in `src/ui/`. Prefer `Result`-based error handling for subprocess and filesystem operations, and run `cargo fmt --all` before committing.
 
 ## Engineering Principles
 

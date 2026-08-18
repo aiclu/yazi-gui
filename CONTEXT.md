@@ -8,6 +8,22 @@ This glossary defines the user-facing concepts used by the graphical file manage
 The tab whose directory, selection, and preview are currently shown.
 _Avoid_: current window, selected page
 
+**Workspace State**:
+The runtime state coordinated by the main window, including GUI tabs, shared file-operation state, settings, and tray state.
+_Avoid_: global model, window cache
+
+**GUI Tab**:
+An independent local file view with its own directory snapshot, selection, sorting, search session, preview, and asynchronous request state.
+_Avoid_: yazi tab, process tab
+
+**Yazi Session**:
+The single yazi backend process shared by GUI tabs. GUI tabs are local views over this session and accept events only for their current directory.
+_Avoid_: one process per tab, protocol bridge state
+
+**Operation Token**:
+A per-view marker attached to an asynchronous scan or refresh request. A result whose token is no longer current is ignored.
+_Avoid_: retry counter, progress percentage
+
 **Address Path**:
 The directory path used to identify and navigate the active tab's location.
 _Avoid_: URL, location string
@@ -53,8 +69,24 @@ A per-tab in-flight refresh marker tied to the requested directory. It prevents 
 _Avoid_: permanent loading state, synchronous reload
 
 **Settings Page**:
-The in-window page for theme, language, shortcuts, autostart, about information, and the explicitly unconfigured update entry.
+The in-window page for theme, language, shortcuts, autostart, about information, and manual release updates.
 _Avoid_: preferences dialog, external settings window
+
+**Update Check**:
+A manual request for the latest stable Windows release that matches the current package type.
+_Avoid_: startup polling, arbitrary update source
+
+**Update Download**:
+A cancellable transfer of the matching release package that is accepted only after its published checksum is verified.
+_Avoid_: unverified installer, background update
+
+**System Proxy**:
+The Windows proxy behavior used by update requests, including automatic configuration selected by the current user or system.
+_Avoid_: app-specific proxy setting, direct-only request
+
+**Restart Update**:
+The explicit action that closes the current GUI, applies a verified package, and starts the updated version.
+_Avoid_: silent update, self-overwrite
 
 **Tray State**:
 The Windows notification-area icon that restores the window on left click and exposes show, settings, and exit on the context menu.
@@ -69,6 +101,10 @@ A relative path returned by a Search Session. It keeps the existing file-row beh
 _Avoid_: virtual file, copied path
 
 ## File Operations
+
+**File Operation**:
+A background filesystem action such as search, copy, delete, or directory scan with an explicit result and user-visible status.
+_Avoid_: service task, command queue
 
 **File Clipboard**:
 The set of selected filesystem entries held for a later copy or cut paste operation.

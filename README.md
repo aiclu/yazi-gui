@@ -13,7 +13,7 @@
 - File previews, syntax highlighting, image previews, and local-time modified timestamps.
 - Copy, cut, and paste with byte-level copy progress and block-boundary cancellation.
 - Computer View for drives, refresh, Windows Recycle Bin handling, and confirmation-based permanent deletion on network drives.
-- Theme, language, shortcut, autostart, tray, and about settings.
+- Theme, language, shortcut, autostart, tray, about, and manual update settings.
 
 ### Requirements
 
@@ -25,6 +25,15 @@
 
 1. Run `cargo run` for a development build; it starts in the current working directory.
 2. Run `cargo build --release` to create `target/release/yazi-gui.exe`.
+
+To run the bundled build locally, build it and explicitly stage the fixed yazi package beside the executable:
+
+```powershell
+cargo build --release --features bundled-yazi
+.\scripts\stage-bundled-yazi.ps1 -YaziDirectory "path\to\yazi-26.8.15"
+```
+
+The staging command requires `yazi.exe` and `ya.exe` version `26.8.15`; the bundled executable does not use `PATH` at runtime.
 
 Useful checks:
 
@@ -40,11 +49,15 @@ Each `v*` tag creates two Windows x64 archives: the GUI-only package, which uses
 
 Settings are stored in `%APPDATA%\yazi-gui\settings.json`, with autostart disabled by default. Runtime yazi configuration lives under `assets/yazi/`; the `gui-files.yazi` plugin publishes directory snapshots consumed by the GUI.
 
+The Settings page can check the latest stable GitHub Release for the matching package, download it through the Windows system proxy with byte progress and cancellation, verify its SHA-256 checksum, and offer a restart to apply it.
+
 ### Project layout
 
 - `src/main.rs` — GPUI UI, tabs, selection, previews, sorting, search, and file operations.
 - `src/yazi.rs` — yazi subprocess bridge and event parsing.
 - `src/settings.rs` / `src/tray.rs` — settings persistence and the Windows tray bridge.
+- `src/update.rs` — GitHub release checks, proxy-aware downloads, checksum verification, and restart updates.
+- `scripts/stage-bundled-yazi.ps1` — explicit local staging for a bundled release build.
 - `assets/yazi/` — bundled yazi configuration and GUI event plugin.
 - `assets/icons/` — SVG/ICO application icon sources.
 - `docs/adr/` — architecture decision records.
@@ -60,7 +73,7 @@ Settings are stored in `%APPDATA%\yazi-gui\settings.json`, with autostart disabl
 - 文件预览、语法高亮、图片预览，以及本地时间格式的修改时间。
 - 复制/剪切/粘贴；复制显示字节级进度，可在块边界取消。
 - “此电脑”磁盘视图、刷新、Windows 回收站和网络驱动器永久删除确认。
-- 主题、语言、快捷键、自启动、托盘和关于页面。
+- 主题、语言、快捷键、自启动、托盘、关于和手动更新设置。
 
 ### 环境要求
 
@@ -72,6 +85,15 @@ Settings are stored in `%APPDATA%\yazi-gui\settings.json`, with autostart disabl
 
 1. 运行 `cargo run` 启动开发版本，程序从当前工作目录开始。
 2. 运行 `cargo build --release` 构建 `target/release/yazi-gui.exe`。
+
+本地运行 bundled 版本时，需要先构建并将固定版本的 yazi 包显式放到可执行文件旁：
+
+```powershell
+cargo build --release --features bundled-yazi
+.\scripts\stage-bundled-yazi.ps1 -YaziDirectory "path\to\yazi-26.8.15"
+```
+
+staging 命令要求 `yazi.exe` 和 `ya.exe` 均为 `26.8.15`；bundled 可执行文件运行时不会使用 `PATH`。
 
 常用验证命令：
 
@@ -87,11 +109,15 @@ cargo test
 
 设置保存在 `%APPDATA%\yazi-gui\settings.json`；自启动默认关闭。运行时 yazi 配置位于 `assets/yazi/`，其中的 `gui-files.yazi` 插件负责向 GUI 发布目录快照。
 
+设置页可以检查与当前包匹配的最新稳定版 GitHub Release，使用 Windows 系统代理下载并显示字节进度、支持取消，校验 SHA-256 后提供重启更新。
+
 ### 项目结构
 
 - `src/main.rs` — GPUI 界面、标签页、选择、预览、排序、搜索和文件操作。
 - `src/yazi.rs` — yazi 子进程桥接和事件解析。
 - `src/settings.rs` / `src/tray.rs` — 设置持久化和 Windows 托盘桥接。
+- `src/update.rs` — GitHub Release 检查、系统代理下载、校验和重启更新。
+- `scripts/stage-bundled-yazi.ps1` — bundled release 本地显式 staging。
 - `assets/yazi/` — 内置 yazi 配置与 GUI 事件插件。
 - `assets/icons/` — SVG/ICO 应用图标源文件。
 - `docs/adr/` — 架构决策记录。

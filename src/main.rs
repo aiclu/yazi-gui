@@ -111,20 +111,9 @@ fn tab_bar_metrics(window_width: f32, tab_count: usize) -> TabBarMetrics {
     }
 }
 
-fn tab_view_start(
-    tab_count: usize,
-    visible_count: usize,
-    active: usize,
-    requested_start: usize,
-) -> usize {
+fn tab_view_start(tab_count: usize, visible_count: usize, requested_start: usize) -> usize {
     let max_start = tab_count.saturating_sub(visible_count);
-    let mut start = requested_start.min(max_start);
-    if active < start {
-        start = active;
-    } else if active >= start + visible_count {
-        start = active + 1 - visible_count;
-    }
-    start.min(max_start)
+    requested_start.min(max_start)
 }
 
 fn default_start_dir() -> String {
@@ -3306,17 +3295,19 @@ impl Root {
             }
             let remove_path = favorite.clone();
             bar = bar.child(
-                item.child(div().text_sm().child(label)).child(
-                    div()
-                        .px_1()
-                        .cursor_pointer()
-                        .id(SharedString::from(format!("favorite-remove-{}", index)))
-                        .on_click(cx.listener(move |this, _event, _window, cx| {
-                            this.toggle_favorite_path(remove_path.clone(), cx);
-                            cx.stop_propagation();
-                        }))
-                        .child("×"),
-                ),
+                item.child(div().text_sm().child(file_icon("", true)))
+                    .child(div().text_sm().child(label))
+                    .child(
+                        div()
+                            .px_1()
+                            .cursor_pointer()
+                            .id(SharedString::from(format!("favorite-remove-{}", index)))
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                this.toggle_favorite_path(remove_path.clone(), cx);
+                                cx.stop_propagation();
+                            }))
+                            .child("×"),
+                    ),
             );
         }
         bar.into_any_element()
@@ -3465,12 +3456,8 @@ impl Root {
     fn tab_bar(&mut self, window_width: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let metrics = tab_bar_metrics(window_width, self.tabs.len());
-        self.tab_view_start = tab_view_start(
-            self.tabs.len(),
-            metrics.visible_count,
-            self.active,
-            self.tab_view_start,
-        );
+        self.tab_view_start =
+            tab_view_start(self.tabs.len(), metrics.visible_count, self.tab_view_start);
         let end = (self.tab_view_start + metrics.visible_count).min(self.tabs.len());
         let can_scroll_left = self.tab_view_start > 0;
         let can_scroll_right = end < self.tabs.len();
@@ -4003,7 +3990,6 @@ impl Root {
             .flex()
             .items_center()
             .justify_center()
-            .bg(theme.crust)
             .id("delete-confirmation-mask")
             .on_click(cx.listener(|this, _event, _window, cx| {
                 this.cancel_delete_confirmation(cx);
@@ -4823,10 +4809,10 @@ mod tests {
     }
 
     #[test]
-    fn tab_view_keeps_active_tab_visible_when_the_strip_overflows() {
-        assert_eq!(tab_view_start(9, 7, 8, 0), 2);
-        assert_eq!(tab_view_start(9, 7, 0, 2), 0);
-        assert_eq!(tab_view_start(9, 7, 4, 1), 1);
+    fn tab_view_allows_manual_scroll_to_the_first_tab() {
+        assert_eq!(tab_view_start(9, 7, 0), 0);
+        assert_eq!(tab_view_start(9, 7, 1), 1);
+        assert_eq!(tab_view_start(9, 7, 99), 2);
     }
 
     #[test]

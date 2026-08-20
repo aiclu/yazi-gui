@@ -282,6 +282,40 @@ pub(crate) fn refresh_button(
     )
 }
 
+pub(crate) fn back_button(
+    cx: &mut Context<Root>,
+    theme: Theme,
+    language: Language,
+    enabled: bool,
+) -> impl IntoElement {
+    tab_scroll_button(
+        cx,
+        theme,
+        "btn-back",
+        "←",
+        settings::translate(language, "后退"),
+        enabled,
+        UiIntent::Back,
+    )
+}
+
+pub(crate) fn forward_button(
+    cx: &mut Context<Root>,
+    theme: Theme,
+    language: Language,
+    enabled: bool,
+) -> impl IntoElement {
+    tab_scroll_button(
+        cx,
+        theme,
+        "btn-forward",
+        "→",
+        settings::translate(language, "前进"),
+        enabled,
+        UiIntent::Forward,
+    )
+}
+
 pub(crate) fn parent_button(
     cx: &mut Context<Root>,
     theme: Theme,

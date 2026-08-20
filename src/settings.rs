@@ -45,6 +45,14 @@ impl Language {
     }
 }
 
+fn default_back_shortcut() -> String {
+    "alt+left".to_string()
+}
+
+fn default_forward_shortcut() -> String {
+    "alt+right".to_string()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShortcutSettings {
     pub open: String,
@@ -58,6 +66,10 @@ pub struct ShortcutSettings {
     pub new_file: String,
     pub new_dir: String,
     pub search: String,
+    #[serde(default = "default_back_shortcut")]
+    pub back: String,
+    #[serde(default = "default_forward_shortcut")]
+    pub forward: String,
 }
 
 impl Default for ShortcutSettings {
@@ -74,6 +86,8 @@ impl Default for ShortcutSettings {
             new_file: "ctrl+n".to_string(),
             new_dir: "ctrl+shift+n".to_string(),
             search: "ctrl+f".to_string(),
+            back: default_back_shortcut(),
+            forward: default_forward_shortcut(),
         }
     }
 }
@@ -156,6 +170,8 @@ pub fn translate(language: Language, text: &str) -> String {
         "关闭" => "Close".to_string(),
         "打开" => "Open".to_string(),
         "搜索" => "Search".to_string(),
+        "后退" => "Back".to_string(),
+        "前进" => "Forward".to_string(),
         "删除" => "Delete".to_string(),
         "重命名" => "Rename".to_string(),
         "复制" => "Copy".to_string(),
@@ -345,6 +361,21 @@ mod tests {
     }
 
     #[test]
+    fn older_settings_use_defaults_for_navigation_shortcuts() {
+        let mut value = serde_json::to_value(AppSettings::default()).unwrap();
+        let shortcuts = value
+            .get_mut("shortcuts")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap();
+        shortcuts.remove("back");
+        shortcuts.remove("forward");
+
+        let decoded: AppSettings = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.shortcuts.back, "alt+left");
+        assert_eq!(decoded.shortcuts.forward, "alt+right");
+    }
+
+    #[test]
     fn settings_without_favorites_are_rejected() {
         let mut value = serde_json::to_value(AppSettings::default()).unwrap();
         value.as_object_mut().unwrap().remove("favorites");
@@ -358,5 +389,7 @@ mod tests {
             translate(Language::English, "检查更新"),
             "Check for updates"
         );
+        assert_eq!(translate(Language::English, "后退"), "Back");
+        assert_eq!(translate(Language::English, "前进"), "Forward");
     }
 }

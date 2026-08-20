@@ -6,6 +6,103 @@ use std::collections::HashMap;
 use std::io;
 use std::ops::Range;
 
+pub(crate) const NAVIGATION_HISTORY_LIMIT: usize = 100;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum NavigationTarget {
+    ComputerView,
+    Directory(String),
+}
+
+impl NavigationTarget {
+    fn same_as(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::ComputerView, Self::ComputerView) => true,
+            (Self::Directory(left), Self::Directory(right)) => {
+                tree_path_key(left) == tree_path_key(right)
+            }
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NavigationHistory {
+    entries: Vec<NavigationTarget>,
+    cursor: usize,
+}
+
+impl NavigationHistory {
+    pub(crate) fn new(initial: NavigationTarget) -> Self {
+        Self {
+            entries: vec![initial],
+            cursor: 0,
+        }
+    }
+
+    pub(crate) fn current(&self) -> &NavigationTarget {
+        &self.entries[self.cursor]
+    }
+
+    pub(crate) fn can_go_back(&self) -> bool {
+        self.cursor > 0
+    }
+
+    pub(crate) fn can_go_forward(&self) -> bool {
+        self.cursor + 1 < self.entries.len()
+    }
+
+    pub(crate) fn back_target(&self) -> Option<(usize, NavigationTarget)> {
+        self.cursor.checked_sub(1).and_then(|cursor| {
+            self.entries
+                .get(cursor)
+                .cloned()
+                .map(|target| (cursor, target))
+        })
+    }
+
+    pub(crate) fn forward_target(&self) -> Option<(usize, NavigationTarget)> {
+        let cursor = self.cursor + 1;
+        self.entries
+            .get(cursor)
+            .cloned()
+            .map(|target| (cursor, target))
+    }
+
+    pub(crate) fn commit_new(&mut self, target: NavigationTarget) -> bool {
+        if self.current().same_as(&target) {
+            return false;
+        }
+        self.entries.truncate(self.cursor + 1);
+        self.entries.push(target);
+        self.cursor = self.entries.len() - 1;
+        if self.entries.len() > NAVIGATION_HISTORY_LIMIT {
+            let removed = self.entries.len() - NAVIGATION_HISTORY_LIMIT;
+            self.entries.drain(..removed);
+            self.cursor = self.cursor.saturating_sub(removed);
+        }
+        true
+    }
+
+    pub(crate) fn commit_cursor(&mut self, cursor: usize) -> bool {
+        if cursor >= self.entries.len() {
+            return false;
+        }
+        self.cursor = cursor;
+        true
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    fn cursor(&self) -> usize {
+        self.cursor
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SortField {
     Name,
@@ -53,6 +150,7 @@ pub enum Preview {
 
 pub struct Tab {
     pub(crate) cwd: String,
+    pub(crate) history: NavigationHistory,
     pub(crate) files: Vec<FileEntry>,
     /// 选中的文件名（单选时含 1 个，多选时多个）。
     pub(crate) selected: Vec<String>,
@@ -85,6 +183,7 @@ impl Tab {
     pub(crate) fn new(cwd: &str) -> Self {
         Self {
             cwd: cwd.to_string(),
+            history: NavigationHistory::new(NavigationTarget::Directory(cwd.to_string())),
             files: Vec::new(),
             selected: Vec::new(),
             anchor: None,
@@ -98,6 +197,13 @@ impl Tab {
             preview: Preview::Empty,
             preview_path: None,
         }
+    }
+
+    pub(crate) fn new_computer() -> Self {
+        let mut tab = Self::new("");
+        tab.computer_view = true;
+        tab.history = NavigationHistory::new(NavigationTarget::ComputerView);
+        tab
     }
 
     pub(crate) fn invalidate_refresh(&mut self) {
@@ -546,5 +652,90 @@ mod tests {
         workspace.cur_mut().search.as_mut().unwrap().generation = 4;
         assert!(!workspace.apply_search_results(&request, vec![file("report.txt")]));
         assert!(workspace.cur().search.as_ref().unwrap().scanning);
+    }
+
+    #[test]
+    fn navigation_history_starts_at_its_initial_target() {
+        let history =
+            NavigationHistory::new(NavigationTarget::Directory(r"D:\Projects".to_string()));
+
+        assert_eq!(
+            history.current(),
+            &NavigationTarget::Directory(r"D:\Projects".to_string())
+        );
+        assert!(!history.can_go_back());
+        assert!(!history.can_go_forward());
+    }
+
+    #[test]
+    fn navigation_history_has_back_and_forward_boundaries() {
+        let mut history =
+            NavigationHistory::new(NavigationTarget::Directory(r"D:\one".to_string()));
+        history.commit_new(NavigationTarget::Directory(r"D:\two".to_string()));
+
+        let (cursor, target) = history.back_target().unwrap();
+        assert_eq!(cursor, 0);
+        assert_eq!(target, NavigationTarget::Directory(r"D:\one".to_string()));
+        assert!(history.commit_cursor(cursor));
+        assert!(!history.can_go_back());
+        assert!(history.can_go_forward());
+
+        let (cursor, target) = history.forward_target().unwrap();
+        assert_eq!(cursor, 1);
+        assert_eq!(target, NavigationTarget::Directory(r"D:\two".to_string()));
+        assert!(history.commit_cursor(cursor));
+        assert!(!history.can_go_forward());
+    }
+
+    #[test]
+    fn navigation_history_collapses_case_and_separator_duplicates() {
+        let mut history =
+            NavigationHistory::new(NavigationTarget::Directory(r"D:\Projects".to_string()));
+
+        assert!(!history.commit_new(NavigationTarget::Directory(r"d:/projects/".to_string(),)));
+        assert_eq!(history.len(), 1);
+    }
+
+    #[test]
+    fn navigation_history_truncates_forward_entries_after_new_navigation() {
+        let mut history =
+            NavigationHistory::new(NavigationTarget::Directory(r"D:\one".to_string()));
+        history.commit_new(NavigationTarget::Directory(r"D:\two".to_string()));
+        history.commit_new(NavigationTarget::Directory(r"D:\three".to_string()));
+        let (cursor, _) = history.back_target().unwrap();
+        history.commit_cursor(cursor);
+
+        assert!(history.commit_new(NavigationTarget::Directory(r"D:\new".to_string())));
+        assert_eq!(history.len(), 3);
+        assert_eq!(history.cursor(), 2);
+        assert!(!history.can_go_forward());
+        assert_eq!(
+            history.current(),
+            &NavigationTarget::Directory(r"D:\new".to_string())
+        );
+    }
+
+    #[test]
+    fn navigation_history_includes_computer_view_as_a_target() {
+        let mut history = NavigationHistory::new(NavigationTarget::ComputerView);
+        history.commit_new(NavigationTarget::Directory(r"C:\".to_string()));
+        assert!(history.can_go_back());
+        let (_, target) = history.back_target().unwrap();
+        assert_eq!(target, NavigationTarget::ComputerView);
+    }
+
+    #[test]
+    fn navigation_history_keeps_at_most_one_hundred_entries() {
+        let mut history = NavigationHistory::new(NavigationTarget::Directory(r"D:\0".to_string()));
+        for index in 1..=150 {
+            history.commit_new(NavigationTarget::Directory(format!(r"D:\{index}")));
+        }
+
+        assert_eq!(history.len(), NAVIGATION_HISTORY_LIMIT);
+        assert_eq!(history.cursor(), NAVIGATION_HISTORY_LIMIT - 1);
+        assert_eq!(
+            history.current(),
+            &NavigationTarget::Directory(r"D:\150".to_string())
+        );
     }
 }

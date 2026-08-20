@@ -40,6 +40,14 @@ _Avoid_: URL, location string
 The virtual top-level view that lists available drive roots before entering a directory.
 _Avoid_: desktop, root directory
 
+**Navigation History**:
+The per-GUI-Tab, in-memory sequence of real directories and Computer View destinations used by the Back and Forward commands during the current application run.
+_Avoid_: recent folders, Favorites Bar
+
+**History Entry**:
+A single destination in a Navigation History. It is either a real directory or Computer View; consecutive equivalent directory paths share one entry.
+_Avoid_: navigation request, refresh snapshot
+
 **Folder Tree**:
 A hierarchical navigation view of real folders below Computer View, drive roots, and their child folders.
 _Avoid_: file tree, global folder index

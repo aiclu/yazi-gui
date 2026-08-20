@@ -42,15 +42,16 @@ pub(crate) use platform::filesystem::is_unc_path;
 use platform::filesystem::scan_drives;
 mod workspace;
 use workspace::{
-    FolderTreeRow, FolderTreeRowKind, Preview, SearchState, SortDirection, SortField, SortState,
-    Tab, WorkspaceState, reconcile_selection, sort_files, tree_ancestor_paths, tree_path_key,
+    FolderTreeRow, FolderTreeRowKind, NavigationTarget, Preview, SearchState, SortDirection,
+    SortField, SortState, Tab, WorkspaceState, reconcile_selection, sort_files,
+    tree_ancestor_paths, tree_path_key,
 };
 mod ui;
 use ui::{
-    InputElement, MenuAction, UiIntent, UiProjection, action_button, computer_button,
-    dialog_button, icon_button, menu_item, menu_items_for, new_tab_button, parent_button,
-    refresh_button, resize_handle, tab_button, tab_name, tab_scroll_button, toolbar_divider,
-    window_control_button,
+    InputElement, MenuAction, UiIntent, UiProjection, action_button, back_button, computer_button,
+    dialog_button, forward_button, icon_button, menu_item, menu_items_for, new_tab_button,
+    parent_button, refresh_button, resize_handle, tab_button, tab_name, tab_scroll_button,
+    toolbar_divider, window_control_button,
 };
 mod settings;
 use platform::tray::{TrayCommand, TrayController};
@@ -214,6 +215,19 @@ enum PendingOp {
     EditShortcut(ShortcutAction),
 }
 
+#[derive(Clone)]
+enum NavigationCommit {
+    NewEntry,
+    HistoryCursor(usize),
+}
+
+#[derive(Clone)]
+struct PendingNavigation {
+    tab_index: usize,
+    target: NavigationTarget,
+    commit: NavigationCommit,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
     Files,
@@ -224,6 +238,8 @@ enum Page {
 enum ShortcutAction {
     Open,
     Search,
+    Back,
+    Forward,
     NewTab,
     CloseTab,
     Delete,
@@ -240,6 +256,8 @@ impl ShortcutAction {
         Some(match id {
             "shortcut-open" => Self::Open,
             "shortcut-search" => Self::Search,
+            "shortcut-back" => Self::Back,
+            "shortcut-forward" => Self::Forward,
             "shortcut-new-tab" => Self::NewTab,
             "shortcut-close-tab" => Self::CloseTab,
             "shortcut-delete" => Self::Delete,
@@ -257,6 +275,8 @@ impl ShortcutAction {
         match self {
             Self::Open => "打开",
             Self::Search => "搜索",
+            Self::Back => "后退",
+            Self::Forward => "前进",
             Self::NewTab => "新建标签页",
             Self::CloseTab => "关闭标签页",
             Self::Delete => "删除",
@@ -273,6 +293,8 @@ impl ShortcutAction {
         match self {
             Self::Open => &shortcuts.open,
             Self::Search => &shortcuts.search,
+            Self::Back => &shortcuts.back,
+            Self::Forward => &shortcuts.forward,
             Self::NewTab => &shortcuts.new_tab,
             Self::CloseTab => &shortcuts.close_tab,
             Self::Delete => &shortcuts.delete,
@@ -289,6 +311,8 @@ impl ShortcutAction {
         match self {
             Self::Open => shortcuts.open = value,
             Self::Search => shortcuts.search = value,
+            Self::Back => shortcuts.back = value,
+            Self::Forward => shortcuts.forward = value,
             Self::NewTab => shortcuts.new_tab = value,
             Self::CloseTab => shortcuts.close_tab = value,
             Self::Delete => shortcuts.delete = value,
@@ -305,6 +329,8 @@ impl ShortcutAction {
         match self {
             Self::Open => "shortcut-open",
             Self::Search => "shortcut-search",
+            Self::Back => "shortcut-back",
+            Self::Forward => "shortcut-forward",
             Self::NewTab => "shortcut-new-tab",
             Self::CloseTab => "shortcut-close-tab",
             Self::Delete => "shortcut-delete",
@@ -456,6 +482,7 @@ struct TransferState {
 struct Root {
     client: Option<YaziSession>,
     workspace: WorkspaceState,
+    pending_navigation: Option<PendingNavigation>,
     clipboard: Option<Clipboard>,
     transfer: Option<TransferState>,
     pending_delete: Option<PendingDelete>,
@@ -504,6 +531,7 @@ impl Root {
         let mut root = Self {
             client: None,
             workspace: WorkspaceState::new(&start_dir),
+            pending_navigation: None,
             clipboard: None,
             transfer: None,
             pending_delete: None,
@@ -587,6 +615,8 @@ impl Root {
             UiIntent::RequestClose => self.request_close(window, cx),
             UiIntent::NewTab => self.new_tab(cx),
             UiIntent::Refresh => self.refresh_current(cx),
+            UiIntent::Back => self.go_back(cx),
+            UiIntent::Forward => self.go_forward(cx),
             UiIntent::Parent => self.go_parent(cx),
             UiIntent::Computer => self.show_computer_view(cx),
             UiIntent::TogglePreview => self.toggle_preview(cx),
@@ -1381,27 +1411,135 @@ impl Root {
     }
 
     fn navigate_to_directory(&mut self, target: String, cx: &mut Context<Self>) {
-        if !Path::new(&target).is_dir() {
-            self.set_status(format!("{}: {}", self.tr("路径不可用"), target));
-            cx.notify();
+        self.navigate_to_target(
+            NavigationTarget::Directory(target),
+            NavigationCommit::NewEntry,
+            cx,
+        );
+    }
+
+    fn navigate_to_target(
+        &mut self,
+        target: NavigationTarget,
+        commit: NavigationCommit,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pending_navigation.is_some() {
             return;
         }
-        self.clear_status();
-        match self.send_checked(&target) {
-            Ok(()) => {
+        match target {
+            NavigationTarget::ComputerView => {
                 self.cancel_input_state();
+                self.clear_status();
                 self.menu = None;
-                let tab = self.cur_mut();
-                tab.selected.clear();
-                tab.anchor = None;
-                tab.computer_view = false;
-                tab.invalidate_refresh();
-                tab.clear_preview();
-                self.sync_folder_tree_to_path(&target, cx);
-                self.set_status(format!("已跳转: {}", target));
+                self.apply_computer_view_state(cx);
+                self.commit_navigation_history(
+                    self.workspace.active,
+                    commit,
+                    NavigationTarget::ComputerView,
+                );
+                self.set_status(format!("已跳转: {}", self.tr("此电脑")));
+                cx.notify();
             }
-            Err(error) => self.set_status(format!("跳转失败: {}", error)),
+            NavigationTarget::Directory(path) => {
+                if !Path::new(&path).is_dir() {
+                    self.set_status(format!("{}: {}", self.tr("路径不可用"), path));
+                    cx.notify();
+                    return;
+                }
+                self.cancel_input_state();
+                self.clear_status();
+                self.menu = None;
+                let tab_index = self.workspace.active;
+                self.pending_navigation = Some(PendingNavigation {
+                    tab_index,
+                    target: NavigationTarget::Directory(path.clone()),
+                    commit,
+                });
+                if let Err(error) = self.send_checked(&path) {
+                    self.pending_navigation = None;
+                    self.set_status(format!("跳转失败: {}", error));
+                }
+                cx.notify();
+            }
         }
+    }
+
+    fn go_back(&mut self, cx: &mut Context<Self>) {
+        let Some((cursor, target)) = self.cur().history.back_target() else {
+            return;
+        };
+        self.navigate_to_target(target, NavigationCommit::HistoryCursor(cursor), cx);
+    }
+
+    fn go_forward(&mut self, cx: &mut Context<Self>) {
+        let Some((cursor, target)) = self.cur().history.forward_target() else {
+            return;
+        };
+        self.navigate_to_target(target, NavigationCommit::HistoryCursor(cursor), cx);
+    }
+
+    fn apply_computer_view_state(&mut self, cx: &mut Context<Self>) {
+        let tab = self.cur_mut();
+        tab.computer_view = true;
+        tab.invalidate_refresh();
+        tab.cancel_search();
+        tab.selected.clear();
+        tab.anchor = None;
+        tab.clear_preview();
+        self.start_drive_scan(cx, false);
+    }
+
+    fn apply_directory_view_state(
+        &mut self,
+        tab_index: usize,
+        cwd: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.workspace.tabs.get_mut(tab_index) else {
+            return;
+        };
+        tab.cwd = cwd.clone();
+        tab.computer_view = false;
+        tab.invalidate_refresh();
+        tab.cancel_search();
+        tab.selected.clear();
+        tab.anchor = None;
+        tab.clear_preview();
+        if self.workspace.active == tab_index {
+            self.sync_folder_tree_to_path(&cwd, cx);
+        }
+    }
+
+    fn commit_navigation_history(
+        &mut self,
+        tab_index: usize,
+        commit: NavigationCommit,
+        target: NavigationTarget,
+    ) {
+        let Some(tab) = self.workspace.tabs.get_mut(tab_index) else {
+            return;
+        };
+        match commit {
+            NavigationCommit::NewEntry => {
+                tab.history.commit_new(target);
+            }
+            NavigationCommit::HistoryCursor(cursor) => {
+                tab.history.commit_cursor(cursor);
+            }
+        }
+    }
+
+    fn finish_pending_navigation(&mut self, target: NavigationTarget, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending_navigation.take() else {
+            return;
+        };
+        self.commit_navigation_history(pending.tab_index, pending.commit, target.clone());
+        let label = match target {
+            NavigationTarget::ComputerView => self.tr("此电脑"),
+            NavigationTarget::Directory(path) => path,
+        };
+        self.set_status(format!("已跳转: {}", label));
         cx.notify();
     }
 
@@ -1482,6 +1620,22 @@ impl Root {
     fn on_event(&mut self, event: YaziEvent, cx: &mut Context<Self>) {
         match event {
             YaziEvent::Cd { url } => {
+                if let Some(pending) = self.pending_navigation.clone() {
+                    if let NavigationTarget::Directory(expected) = pending.target {
+                        let Some(url) = url else {
+                            return;
+                        };
+                        if tree_path_key(&url) == tree_path_key(&expected) {
+                            self.apply_directory_view_state(pending.tab_index, url.clone(), cx);
+                            self.finish_pending_navigation(NavigationTarget::Directory(url), cx);
+                        } else {
+                            self.pending_navigation = None;
+                            self.set_status(format!("跳转失败: {}", expected));
+                            cx.notify();
+                        }
+                    }
+                    return;
+                }
                 if !self.cur().computer_view {
                     self.cancel_input_state();
                     let previous_cwd = tree_path_key(&self.cur().cwd);
@@ -1497,6 +1651,21 @@ impl Root {
                 }
             }
             YaziEvent::GuiFiles { cwd, files } => {
+                if let Some(pending) = self.pending_navigation.clone() {
+                    if let NavigationTarget::Directory(expected) = pending.target {
+                        if tree_path_key(&cwd) == tree_path_key(&expected) {
+                            self.apply_directory_view_state(pending.tab_index, cwd.clone(), cx);
+                            if self.workspace.apply_gui_files(cwd.clone(), files).is_some() {
+                                self.reconcile_preview();
+                                self.finish_pending_navigation(
+                                    NavigationTarget::Directory(cwd),
+                                    cx,
+                                );
+                            }
+                        }
+                    }
+                    return;
+                }
                 if let Some(refreshed) = self.workspace.apply_gui_files(cwd, files) {
                     if refreshed {
                         self.set_status(format!(
@@ -1639,7 +1808,7 @@ impl Root {
         self.clear_status();
         if click_count >= 2 {
             if is_dir {
-                self.enter(name);
+                self.enter(name, cx);
             } else {
                 self.open_path(name, cx);
             }
@@ -1768,10 +1937,19 @@ impl Root {
     }
 
     fn send(&self, cwd: &str) {
+        if self.pending_navigation.is_some()
+            || self.cur().computer_view
+            || tree_path_key(&self.cur().cwd) != tree_path_key(cwd)
+        {
+            return;
+        }
         let _ = self.send_checked(cwd);
     }
 
     fn refresh_current(&mut self, cx: &mut Context<Self>) {
+        if self.pending_navigation.is_some() {
+            return;
+        }
         self.cancel_input_state();
         self.menu = None;
         if self.pending_delete.is_some() {
@@ -1844,38 +2022,28 @@ impl Root {
         cx.notify();
     }
 
-    fn enter(&mut self, name: &str) {
-        self.cancel_input_state();
-        self.clear_status();
+    fn enter(&mut self, name: &str, cx: &mut Context<Self>) {
         if self.cur().computer_view {
             // 点击盘符：进入该磁盘根目录
-            self.cur_mut().computer_view = false;
-            self.cur_mut().invalidate_refresh();
-            self.cur_mut().cwd = name.to_string();
-            self.cur_mut().selected.clear();
-            self.cur_mut().anchor = None;
-            self.cur_mut().clear_preview();
-            self.send(name);
+            self.navigate_to_directory(name.to_string(), cx);
             return;
         }
-        self.cur_mut().invalidate_refresh();
         let path = std::path::Path::new(&self.cur().cwd).join(name);
-        self.send(&path.to_string_lossy());
+        self.navigate_to_directory(path.to_string_lossy().into_owned(), cx);
     }
 
     fn show_computer_view(&mut self, cx: &mut Context<Self>) {
-        self.cancel_input_state();
-        self.clear_status();
-        self.menu = None;
-        self.cur_mut().computer_view = true;
-        self.cur_mut().selected.clear();
-        self.cur_mut().anchor = None;
-        self.cur_mut().clear_preview();
-        self.start_drive_scan(cx, true);
-        cx.notify();
+        self.navigate_to_target(
+            NavigationTarget::ComputerView,
+            NavigationCommit::NewEntry,
+            cx,
+        );
     }
 
     fn go_parent(&mut self, cx: &mut Context<Self>) {
+        if self.pending_navigation.is_some() {
+            return;
+        }
         self.cancel_input_state();
         self.clear_status();
         if self.cur().computer_view {
@@ -1883,16 +2051,21 @@ impl Root {
         }
         if is_drive_root(&self.cur().cwd) {
             // 从盘符根向上 → 进入「此电脑」虚拟视图
-            self.cur_mut().computer_view = true;
-            self.cur_mut().selected.clear();
-            self.cur_mut().anchor = None;
-            self.cur_mut().clear_preview();
-            self.start_drive_scan(cx, true);
-            cx.notify();
+            self.navigate_to_target(
+                NavigationTarget::ComputerView,
+                NavigationCommit::NewEntry,
+                cx,
+            );
             return;
         }
-        self.cur_mut().invalidate_refresh();
-        self.send("..");
+        let Some(parent) = Path::new(&self.cur().cwd).parent() else {
+            return;
+        };
+        let parent = parent.to_string_lossy().into_owned();
+        if parent.is_empty() || tree_path_key(&parent) == tree_path_key(&self.cur().cwd) {
+            return;
+        }
+        self.navigate_to_directory(parent, cx);
     }
 
     fn open_path(&self, name: &str, cx: &mut Context<Self>) {
@@ -1920,12 +2093,12 @@ impl Root {
             return;
         };
         if tab.computer_view {
-            self.enter(&name);
+            self.enter(&name, cx);
             return;
         }
         let is_dir = tab.files.iter().any(|f| f.name == name && f.is_dir);
         if is_dir {
-            self.enter(&name);
+            self.enter(&name, cx);
         } else {
             self.open_path(&name, cx);
         }
@@ -2273,7 +2446,7 @@ impl Root {
                         .iter()
                         .any(|file| &file.name == name && file.is_dir);
                     if is_dir {
-                        self.enter(name);
+                        self.enter(name, cx);
                     } else {
                         self.open_path(name, cx);
                     }
@@ -2410,6 +2583,9 @@ impl Root {
     // ---- 多标签 ----
 
     fn switch_tab(&mut self, i: usize, cx: &mut Context<Self>) {
+        if self.pending_navigation.is_some() {
+            return;
+        }
         self.cancel_input_state();
         self.clear_status();
         if i == self.workspace.active || i >= self.workspace.tabs.len() {
@@ -2431,11 +2607,13 @@ impl Root {
     }
 
     fn new_tab(&mut self, cx: &mut Context<Self>) {
+        if self.pending_navigation.is_some() {
+            return;
+        }
         self.cancel_input_state();
         self.clear_status();
         self.cur_mut().invalidate_refresh();
-        let mut tab = Tab::new("");
-        tab.computer_view = true;
+        let tab = Tab::new_computer();
         self.workspace.tabs.push(tab);
         self.workspace.active = self.workspace.tabs.len() - 1;
         self.workspace.tab_view_start = self.workspace.active;
@@ -2447,6 +2625,9 @@ impl Root {
     }
 
     fn close_tab(&mut self, i: usize, cx: &mut Context<Self>) {
+        if self.pending_navigation.is_some() {
+            return;
+        }
         self.cancel_input_state();
         self.clear_status();
         if i >= self.workspace.tabs.len() {
@@ -2469,9 +2650,13 @@ impl Root {
             self.workspace.active = len - 1;
         }
         self.cur_mut().clear_preview();
-        let cwd = self.workspace.tabs[self.workspace.active].cwd.clone();
-        self.send(cwd.as_str());
-        self.sync_folder_tree_to_path(&cwd, cx);
+        if self.cur().computer_view {
+            self.start_drive_scan(cx, false);
+        } else {
+            let cwd = self.workspace.tabs[self.workspace.active].cwd.clone();
+            self.send(cwd.as_str());
+            self.sync_folder_tree_to_path(&cwd, cx);
+        }
         cx.notify();
     }
 
@@ -2539,6 +2724,9 @@ impl Root {
     }
 
     fn start_goto(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending_navigation.is_some() {
+            return;
+        }
         let cwd = self.cur().cwd.clone();
         self.cancel_input_state();
         self.reset_input_editor(cwd, true);
@@ -2776,7 +2964,11 @@ impl Root {
             }
             return;
         }
-        if shortcut_matches(&self.settings.shortcuts.new_tab, ks) {
+        if shortcut_matches(&self.settings.shortcuts.back, ks) {
+            self.go_back(cx);
+        } else if shortcut_matches(&self.settings.shortcuts.forward, ks) {
+            self.go_forward(cx);
+        } else if shortcut_matches(&self.settings.shortcuts.new_tab, ks) {
             self.new_tab(cx);
         } else if shortcut_matches(&self.settings.shortcuts.close_tab, ks) {
             self.close_tab(self.workspace.active, cx);
@@ -3618,6 +3810,9 @@ impl Render for Root {
         } else {
             self.tr("收藏当前目录")
         };
+        let navigation_locked = self.pending_navigation.is_some();
+        let can_go_back = !navigation_locked && self.cur().history.can_go_back();
+        let can_go_forward = !navigation_locked && self.cur().history.can_go_forward();
         let action_row = div()
             .w_full()
             .px_4()
@@ -3725,6 +3920,32 @@ impl Render for Root {
                     }
                 }),
             )
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Back),
+                cx.listener(|this, _event, _window, cx| {
+                    this.go_back(cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Navigate(NavigationDirection::Back),
+                cx.listener(|_this, _event, _window, cx| {
+                    cx.stop_propagation();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Forward),
+                cx.listener(|this, _event, _window, cx| {
+                    this.go_forward(cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Navigate(NavigationDirection::Forward),
+                cx.listener(|_this, _event, _window, cx| {
+                    cx.stop_propagation();
+                }),
+            )
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.on_input_key(event, window, cx);
             }))
@@ -3741,6 +3962,8 @@ impl Render for Root {
                     .flex()
                     .items_center()
                     .gap_2()
+                    .child(back_button(cx, theme, self.language(), can_go_back))
+                    .child(forward_button(cx, theme, self.language(), can_go_forward))
                     .child(parent_button(cx, theme, self.language()))
                     .child(refresh_button(cx, theme, self.language()))
                     .child(computer_button(cx, theme, self.language()))
@@ -3981,10 +4204,12 @@ fn normalize_shortcut(raw: &str) -> String {
     raw.trim().to_ascii_lowercase().replace(' ', "")
 }
 
-fn shortcut_actions() -> [ShortcutAction; 11] {
+fn shortcut_actions() -> [ShortcutAction; 13] {
     [
         ShortcutAction::Open,
         ShortcutAction::Search,
+        ShortcutAction::Back,
+        ShortcutAction::Forward,
         ShortcutAction::NewTab,
         ShortcutAction::CloseTab,
         ShortcutAction::Delete,
@@ -4265,13 +4490,14 @@ fn main() {
 mod tests {
     use super::{
         APPLICATION_ICON_ASSET, AppAssets, DeleteSummary, FileEntry, LayoutState,
-        MODIFIED_WIDTH_MIN, PREVIEW_WIDTH_MAX, ResizeTarget, SortDirection, SortField, SortState,
-        TAB_DEFAULT_WIDTH, TAB_MIN_WIDTH, TREE_WIDTH_MIN, TransferControl, TransferOutcome,
-        clamp_layout_width, copy_paths_with_progress, delete_status, favorite_path_key,
-        format_mtime, horizontal_scrollbar_metrics, is_unc_path, keystroke_to_shortcut,
-        normalize_favorite_path, normalize_shortcut, normalize_single_path, permanent_delete,
-        reconcile_selection, resolve_address_path, scan_folder_children, search_directory,
-        sort_files, tab_bar_metrics, tab_view_start, tree_ancestor_paths, tree_path_key,
+        MODIFIED_WIDTH_MIN, PREVIEW_WIDTH_MAX, ResizeTarget, ShortcutAction, SortDirection,
+        SortField, SortState, TAB_DEFAULT_WIDTH, TAB_MIN_WIDTH, TREE_WIDTH_MIN, TransferControl,
+        TransferOutcome, clamp_layout_width, copy_paths_with_progress, delete_status,
+        favorite_path_key, format_mtime, horizontal_scrollbar_metrics, is_unc_path,
+        keystroke_to_shortcut, normalize_favorite_path, normalize_shortcut, normalize_single_path,
+        permanent_delete, reconcile_selection, resolve_address_path, scan_folder_children,
+        search_directory, shortcut_actions, shortcut_matches, sort_files, tab_bar_metrics,
+        tab_view_start, tree_ancestor_paths, tree_path_key,
     };
     use std::fs;
 
@@ -4538,6 +4764,28 @@ mod tests {
             keystroke_to_shortcut(&keystroke),
             Some("ctrl+shift+f".to_string())
         );
+    }
+
+    #[test]
+    fn matches_default_navigation_shortcuts() {
+        let back = gpui::Keystroke::parse("alt-left").unwrap();
+        let forward = gpui::Keystroke::parse("alt-right").unwrap();
+        assert!(shortcut_matches("alt+left", &back));
+        assert!(shortcut_matches("alt+right", &forward));
+        assert!(!shortcut_matches("alt+left", &forward));
+    }
+
+    #[test]
+    fn navigation_shortcuts_participate_in_conflict_detection() {
+        let mut shortcuts = super::settings::ShortcutSettings::default();
+        shortcuts.forward = shortcuts.back.clone();
+        let conflict = shortcut_actions().into_iter().find(|candidate| {
+            *candidate != ShortcutAction::Forward
+                && normalize_shortcut(candidate.shortcut(&shortcuts))
+                    == normalize_shortcut(&shortcuts.forward)
+        });
+
+        assert!(matches!(conflict, Some(ShortcutAction::Back)));
     }
 
     #[test]

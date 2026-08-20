@@ -25,6 +25,8 @@ pub(crate) fn render(
         [
             ShortcutAction::Open,
             ShortcutAction::Search,
+            ShortcutAction::Back,
+            ShortcutAction::Forward,
             ShortcutAction::NewTab,
             ShortcutAction::CloseTab,
             ShortcutAction::Delete,
@@ -57,6 +59,32 @@ pub(crate) fn render(
         .text_color(theme.text)
         .id("root")
         .track_focus(&focus_handle)
+        .on_mouse_down(
+            MouseButton::Navigate(NavigationDirection::Back),
+            cx.listener(|this, _event, _window, cx| {
+                this.go_back(cx);
+                cx.stop_propagation();
+            }),
+        )
+        .on_mouse_up(
+            MouseButton::Navigate(NavigationDirection::Back),
+            cx.listener(|_this, _event, _window, cx| {
+                cx.stop_propagation();
+            }),
+        )
+        .on_mouse_down(
+            MouseButton::Navigate(NavigationDirection::Forward),
+            cx.listener(|this, _event, _window, cx| {
+                this.go_forward(cx);
+                cx.stop_propagation();
+            }),
+        )
+        .on_mouse_up(
+            MouseButton::Navigate(NavigationDirection::Forward),
+            cx.listener(|_this, _event, _window, cx| {
+                cx.stop_propagation();
+            }),
+        )
         .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
             this.on_input_key(event, window, cx);
         }))

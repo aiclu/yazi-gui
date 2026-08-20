@@ -19,7 +19,10 @@ fn main() {
             "--local-events",
             "cd,hover,gui-files",
         ])
-        .env("YAZI_CONFIG_HOME", "D:\\Projects\\gui_for_yazi\\assets\\yazi")
+        .env(
+            "YAZI_CONFIG_HOME",
+            "D:\\Projects\\gui_for_yazi\\assets\\yazi",
+        )
         .current_dir("D:\\Projects\\gui_for_yazi")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -53,7 +56,12 @@ fn main() {
     std::thread::sleep(Duration::from_secs(3));
 
     let out = Command::new("ya")
-        .args(["emit-to", &client_id, "reveal", "D:\\Projects\\gui_for_yazi\\Cargo.toml"])
+        .args([
+            "emit-to",
+            &client_id,
+            "reveal",
+            "D:\\Projects\\gui_for_yazi\\Cargo.toml",
+        ])
         .output();
     match out {
         Ok(o) => eprintln!(

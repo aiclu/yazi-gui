@@ -1,4 +1,5 @@
 use super::super::*;
+use super::{MenuAction, UiIntent};
 
 pub(crate) fn tab_name(cwd: &str) -> String {
     let name = file_name_of(cwd);
@@ -32,13 +33,13 @@ pub(crate) fn tab_button(
         .gap_2()
         .id(SharedString::from(format!("tab-{}", i)))
         .hover(|style| style.bg(theme.hover))
-        .on_click(cx.listener(move |this, _e, _w, cx| {
-            this.switch_tab(i, cx);
+        .on_click(cx.listener(move |this, _e, window, cx| {
+            this.dispatch_ui_intent(UiIntent::SwitchTab(i), window, cx);
         }))
         .on_mouse_down(
             MouseButton::Middle,
-            cx.listener(move |this, _e, _w, cx| {
-                this.close_tab(i, cx);
+            cx.listener(move |this, _e, window, cx| {
+                this.dispatch_ui_intent(UiIntent::CloseTab(i), window, cx);
                 cx.stop_propagation();
             }),
         )
@@ -60,8 +61,8 @@ pub(crate) fn tab_button(
                 .cursor_pointer()
                 .child("×")
                 .id(SharedString::from(format!("tab-close-{}", i)))
-                .on_click(cx.listener(move |this, _e, _w, cx| {
-                    this.close_tab(i, cx);
+                .on_click(cx.listener(move |this, _e, window, cx| {
+                    this.dispatch_ui_intent(UiIntent::CloseTab(i), window, cx);
                     cx.stop_propagation();
                 })),
         )
@@ -75,7 +76,7 @@ pub(crate) fn tab_scroll_button(
     icon: &'static str,
     tooltip: impl Into<SharedString>,
     enabled: bool,
-    on_click: impl Fn(&mut Root, &mut Window, &mut Context<Root>) + 'static,
+    intent: UiIntent,
 ) -> impl IntoElement {
     let tooltip = tooltip.into();
     div()
@@ -107,7 +108,7 @@ pub(crate) fn tab_scroll_button(
         })
         .on_click(cx.listener(move |this, _event, window, cx| {
             if enabled {
-                on_click(this, window, cx);
+                this.dispatch_ui_intent(intent.clone(), window, cx);
             }
             cx.stop_propagation();
         }))
@@ -140,7 +141,7 @@ pub(crate) fn icon_button(
     id: &'static str,
     icon: impl Into<SharedString>,
     tooltip: impl Into<SharedString>,
-    on_click: impl Fn(&mut Root, &mut Window, &mut Context<Root>) + 'static,
+    intent: UiIntent,
 ) -> impl IntoElement {
     let tooltip = tooltip.into();
     div()
@@ -166,7 +167,7 @@ pub(crate) fn icon_button(
             .into()
         })
         .on_click(cx.listener(move |this, _event, window, cx| {
-            on_click(this, window, cx);
+            this.dispatch_ui_intent(intent.clone(), window, cx);
             cx.stop_propagation();
         }))
 }
@@ -177,7 +178,7 @@ pub(crate) fn window_control_button(
     id: &'static str,
     icon: &'static str,
     tooltip: impl Into<SharedString>,
-    on_click: impl Fn(&mut Root, &mut Window, &mut Context<Root>) + 'static,
+    intent: UiIntent,
 ) -> impl IntoElement {
     let tooltip = tooltip.into();
     div()
@@ -198,7 +199,7 @@ pub(crate) fn window_control_button(
             .into()
         })
         .on_click(cx.listener(move |this, _event, window, cx| {
-            on_click(this, window, cx);
+            this.dispatch_ui_intent(intent.clone(), window, cx);
             cx.stop_propagation();
         }))
         .child(icon)
@@ -220,20 +221,33 @@ pub(crate) fn resize_handle(
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
-                this.begin_resize(target, f32::from(event.position.x), cx);
+                this.dispatch_ui_intent(
+                    UiIntent::BeginResize {
+                        target,
+                        x: f32::from(event.position.x),
+                    },
+                    _window,
+                    cx,
+                );
                 cx.stop_propagation();
             }),
         )
         .on_mouse_up_out(
             MouseButton::Left,
-            cx.listener(|this, _event, _window, cx| this.end_resize(cx)),
+            cx.listener(|this, _event, window, cx| {
+                this.dispatch_ui_intent(UiIntent::EndResize, window, cx)
+            }),
         )
         .on_drag(target, |_target: &ResizeTarget, _position, _window, cx| {
             cx.new(|_| ResizeGhost)
         })
         .on_drag_move(cx.listener(
             move |this, event: &DragMoveEvent<ResizeTarget>, _window, cx| {
-                this.resize_layout(f32::from(event.event.position.x), cx);
+                this.dispatch_ui_intent(
+                    UiIntent::MoveResize(f32::from(event.event.position.x)),
+                    _window,
+                    cx,
+                );
             },
         ))
 }
@@ -249,9 +263,7 @@ pub(crate) fn new_tab_button(
         "btn-new-tab",
         "+",
         settings::translate(language, "新建标签页"),
-        |this, _window, cx| {
-            this.new_tab(cx);
-        },
+        UiIntent::NewTab,
     )
 }
 
@@ -266,9 +278,7 @@ pub(crate) fn refresh_button(
         "btn-refresh",
         "↻",
         settings::translate(language, "刷新"),
-        |this, _window, cx| {
-            this.refresh_current(cx);
-        },
+        UiIntent::Refresh,
     )
 }
 
@@ -283,9 +293,7 @@ pub(crate) fn parent_button(
         "btn-parent",
         "↑",
         settings::translate(language, "上级"),
-        |this, _window, cx| {
-            this.go_parent(cx);
-        },
+        UiIntent::Parent,
     )
 }
 
@@ -300,9 +308,7 @@ pub(crate) fn computer_button(
         "btn-computer",
         "🖥",
         settings::translate(language, "此电脑"),
-        |this, _window, cx| {
-            this.show_computer_view(cx);
-        },
+        UiIntent::Computer,
     )
 }
 
@@ -311,7 +317,7 @@ pub(crate) fn action_button(
     theme: Theme,
     id: &'static str,
     label: impl Into<SharedString>,
-    on_click: impl Fn(&mut Root, &mut Window, &mut Context<Root>) + 'static,
+    intent: UiIntent,
 ) -> impl IntoElement {
     div()
         .px_2()
@@ -326,7 +332,7 @@ pub(crate) fn action_button(
         .id(id)
         .hover(|style| style.bg(theme.hover))
         .on_click(cx.listener(move |this, _event, window, cx| {
-            on_click(this, window, cx);
+            this.dispatch_ui_intent(intent.clone(), window, cx);
         }))
 }
 
@@ -376,7 +382,7 @@ pub(crate) fn dialog_button(
     theme: Theme,
     id: &'static str,
     label: impl Into<SharedString>,
-    on_click: impl Fn(&mut Root, &mut Window, &mut Context<Root>) + 'static,
+    intent: UiIntent,
 ) -> impl IntoElement {
     div()
         .px_2()
@@ -388,7 +394,7 @@ pub(crate) fn dialog_button(
         .child(label.into())
         .id(id)
         .on_click(cx.listener(move |this, _event, window, cx| {
-            on_click(this, window, cx);
+            this.dispatch_ui_intent(intent.clone(), window, cx);
             cx.stop_propagation();
         }))
 }
@@ -399,7 +405,7 @@ pub(crate) fn settings_line(
     label: String,
     value: String,
     id: &'static str,
-    on_click: impl Fn(&mut Root, &mut Window, &mut Context<Root>) + 'static,
+    intent: UiIntent,
 ) -> AnyElement {
     div()
         .w_full()
@@ -408,7 +414,7 @@ pub(crate) fn settings_line(
         .items_center()
         .gap_2()
         .child(div().flex_1().text_sm().child(label))
-        .child(action_button(cx, theme, id, value, on_click))
+        .child(action_button(cx, theme, id, value, intent))
         .into_any_element()
 }
 
@@ -506,7 +512,7 @@ pub(crate) fn menu_item(
         .child(label)
         .id(id)
         .on_click(cx.listener(move |this, _event, window, cx| {
-            this.exec_menu_action(action, window, cx);
+            this.dispatch_ui_intent(UiIntent::ExecuteMenu(action), window, cx);
             cx.stop_propagation();
         }))
         .into_any_element()
@@ -539,8 +545,8 @@ pub(crate) fn sort_header(
         .overflow_hidden()
         .text_color(if active { theme.text } else { theme.muted })
         .id(SharedString::from(format!("sort-{:?}", field)))
-        .on_click(cx.listener(move |this, _event, _window, cx| {
-            this.toggle_sort(field, cx);
+        .on_click(cx.listener(move |this, _event, window, cx| {
+            this.dispatch_ui_intent(UiIntent::ToggleSort(field), window, cx);
             cx.stop_propagation();
         }))
         .child(SharedString::from(format!("{}{}", label, arrow)))
@@ -627,16 +633,32 @@ pub(crate) fn file_row(
                     theme.hover
                 })
             })
-            .on_click(cx.listener(move |this, event: &ClickEvent, _window, cx| {
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 let modifiers = event.modifiers();
                 let click_count = event.click_count();
-                this.click_file(&click_name, is_dir, modifiers, click_count, cx);
+                this.dispatch_ui_intent(
+                    UiIntent::ClickFile {
+                        name: click_name.clone(),
+                        is_dir,
+                        modifiers,
+                        click_count,
+                    },
+                    window,
+                    cx,
+                );
                 cx.stop_propagation();
             }))
             .on_mouse_down(
                 MouseButton::Right,
-                cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
-                    this.open_menu(Some(right_name.clone()), event.position, cx);
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.dispatch_ui_intent(
+                        UiIntent::OpenMenu {
+                            target: Some(right_name.clone()),
+                            position: event.position,
+                        },
+                        window,
+                        cx,
+                    );
                     cx.stop_propagation();
                 }),
             );

@@ -268,6 +268,169 @@ impl FolderTreeState {
     }
 }
 
+/// 工作区的持久状态：标签页、当前标签页、磁盘树以及异步请求令牌。
+pub(crate) struct WorkspaceState {
+    pub(crate) tabs: Vec<Tab>,
+    pub(crate) active: usize,
+    pub(crate) tab_view_start: usize,
+    pub(crate) drive_roots: Vec<String>,
+    pub(crate) folder_tree: FolderTreeState,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RefreshRequest {
+    pub(crate) tab_index: usize,
+    pub(crate) cwd: String,
+    pub(crate) request_id: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SearchRequest {
+    pub(crate) tab_index: usize,
+    pub(crate) cwd: String,
+    pub(crate) query: String,
+    pub(crate) generation: u64,
+}
+
+impl WorkspaceState {
+    pub(crate) fn new(cwd: &str) -> Self {
+        Self {
+            tabs: vec![Tab::new(cwd)],
+            active: 0,
+            tab_view_start: 0,
+            drive_roots: Vec::new(),
+            folder_tree: FolderTreeState::default(),
+        }
+    }
+
+    pub(crate) fn cur(&self) -> &Tab {
+        &self.tabs[self.active]
+    }
+
+    pub(crate) fn cur_mut(&mut self) -> &mut Tab {
+        &mut self.tabs[self.active]
+    }
+
+    pub(crate) fn begin_refresh(&mut self) -> Option<RefreshRequest> {
+        let tab_index = self.active;
+        let tab = self.tabs.get_mut(tab_index)?;
+        if tab.computer_view || tab.refreshing {
+            return None;
+        }
+        tab.refresh_request_id = tab.refresh_request_id.wrapping_add(1);
+        tab.refreshing = true;
+        Some(RefreshRequest {
+            tab_index,
+            cwd: tab.cwd.clone(),
+            request_id: tab.refresh_request_id,
+        })
+    }
+
+    pub(crate) fn finish_refresh(&mut self, request: &RefreshRequest) -> bool {
+        let Some(tab) = self.tabs.get_mut(request.tab_index) else {
+            return false;
+        };
+        if !tab.refreshing
+            || tab.refresh_request_id != request.request_id
+            || tree_path_key(&tab.cwd) != tree_path_key(&request.cwd)
+        {
+            return false;
+        }
+        tab.refreshing = false;
+        true
+    }
+
+    pub(crate) fn begin_search_request(&self) -> Option<SearchRequest> {
+        let tab_index = self.active;
+        let tab = self.tabs.get(tab_index)?;
+        let search = tab.search.as_ref()?;
+        Some(SearchRequest {
+            tab_index,
+            cwd: search.cwd.clone(),
+            query: search.query.clone(),
+            generation: search.generation,
+        })
+    }
+
+    pub(crate) fn apply_search_results(
+        &mut self,
+        request: &SearchRequest,
+        mut results: Vec<FileEntry>,
+    ) -> bool {
+        let Some(tab) = self.tabs.get_mut(request.tab_index) else {
+            return false;
+        };
+        let valid = tab.search.as_ref().is_some_and(|search| {
+            search.generation == request.generation
+                && search.cwd == request.cwd
+                && search.query == request.query
+        });
+        if !valid {
+            return false;
+        }
+        sort_files(&mut results, tab.sort);
+        let names = results
+            .iter()
+            .map(|file| file.name.clone())
+            .collect::<Vec<_>>();
+        if let Some(search) = tab.search.as_mut() {
+            search.results = results;
+            search.scanning = false;
+        }
+        reconcile_selection(&mut tab.selected, &mut tab.anchor, &names);
+        true
+    }
+
+    pub(crate) fn fail_search(&mut self, request: &SearchRequest) -> bool {
+        let Some(tab) = self.tabs.get_mut(request.tab_index) else {
+            return false;
+        };
+        let valid = tab.search.as_ref().is_some_and(|search| {
+            search.generation == request.generation
+                && search.cwd == request.cwd
+                && search.query == request.query
+        });
+        if !valid {
+            return false;
+        }
+        if let Some(search) = tab.search.as_mut() {
+            search.results.clear();
+            search.scanning = false;
+        }
+        true
+    }
+
+    pub(crate) fn apply_gui_files(
+        &mut self,
+        cwd: String,
+        mut files: Vec<FileEntry>,
+    ) -> Option<bool> {
+        if self.cur().computer_view || tree_path_key(&self.cur().cwd) != tree_path_key(&cwd) {
+            return None;
+        }
+        let tab = self.cur_mut();
+        let refreshed = tab.refreshing && tree_path_key(&tab.cwd) == tree_path_key(&cwd);
+        tab.cwd = cwd;
+        sort_files(&mut files, tab.sort);
+        let names = files
+            .iter()
+            .map(|file| file.name.clone())
+            .collect::<Vec<_>>();
+        tab.files = files;
+        if refreshed {
+            tab.invalidate_refresh();
+        }
+        if !tab
+            .search
+            .as_ref()
+            .is_some_and(|search| !search.query.is_empty())
+        {
+            reconcile_selection(&mut tab.selected, &mut tab.anchor, &names);
+        }
+        Some(refreshed)
+    }
+}
+
 pub(crate) fn tree_path_key(path: &str) -> String {
     let mut normalized = path.replace('/', "\\");
     while normalized.len() > 3 && normalized.ends_with('\\') {
@@ -341,4 +504,47 @@ pub(crate) fn sort_files(files: &mut [FileEntry], sort: SortState) {
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
             .then_with(|| a.name.cmp(&b.name))
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file(name: &str) -> FileEntry {
+        FileEntry {
+            name: name.to_string(),
+            is_dir: false,
+            size: 1,
+            mtime: 0.0,
+        }
+    }
+
+    #[test]
+    fn refresh_request_is_owned_by_workspace_state() {
+        let mut workspace = WorkspaceState::new(r"D:\Projects");
+        let request = workspace.begin_refresh().unwrap();
+        assert!(!workspace.finish_refresh(&RefreshRequest {
+            request_id: request.request_id.wrapping_add(1),
+            ..request.clone()
+        }));
+        assert!(workspace.cur().refreshing);
+        assert!(workspace.finish_refresh(&request));
+        assert!(!workspace.cur().refreshing);
+    }
+
+    #[test]
+    fn search_results_are_rejected_after_generation_changes() {
+        let mut workspace = WorkspaceState::new(r"D:\Projects");
+        workspace.cur_mut().search = Some(SearchState {
+            cwd: r"D:\Projects".to_string(),
+            query: "report".to_string(),
+            results: Vec::new(),
+            generation: 3,
+            scanning: true,
+        });
+        let request = workspace.begin_search_request().unwrap();
+        workspace.cur_mut().search.as_mut().unwrap().generation = 4;
+        assert!(!workspace.apply_search_results(&request, vec![file("report.txt")]));
+        assert!(workspace.cur().search.as_ref().unwrap().scanning);
+    }
 }

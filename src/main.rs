@@ -1,15 +1,9 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 use gpui::*;
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::ops::Range;
-#[cfg(windows)]
-use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::{
-    Arc, OnceLock,
-    atomic::{AtomicBool, Ordering as AtomicOrdering},
-};
+use std::sync::{Arc, OnceLock, atomic::AtomicBool};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -32,33 +26,38 @@ actions!(
 );
 
 mod yazi;
-use yazi::{FileEntry, YaziClient, YaziEvent};
+use yazi::{FileEntry, YaziEvent, YaziSession};
 mod fs_ops;
+mod platform;
 #[cfg(test)]
-pub(crate) use fs_ops::{DeleteSummary, TEMP_SEQUENCE, is_unc_path, permanent_delete};
+pub(crate) use fs_ops::{DeleteSummary, TEMP_SEQUENCE, permanent_delete};
 use fs_ops::{
-    TransferOutcome, TransferUpdate, copy_paths_with_progress, create_directory, create_file,
-    delete_paths_with_policy, delete_status, file_name_of, format_mtime, is_drive_root, move_paths,
-    network_path_count, rename_path, scan_drives, scan_folder_children, search_directory,
+    TransferControl, TransferOutcome, TransferUpdate, copy_paths_with_progress, create_directory,
+    create_file, delete_paths_with_policy, delete_status, file_name_of, format_mtime,
+    is_drive_root, move_paths, network_path_count, operation_status, rename_path,
+    scan_folder_children, search_directory,
 };
+#[cfg(test)]
+pub(crate) use platform::filesystem::is_unc_path;
+use platform::filesystem::scan_drives;
 mod workspace;
 use workspace::{
-    FolderTreeRow, FolderTreeRowKind, FolderTreeState, Preview, SearchState, SortDirection,
-    SortField, SortState, Tab, reconcile_selection, sort_files, tree_ancestor_paths, tree_path_key,
+    FolderTreeRow, FolderTreeRowKind, Preview, SearchState, SortDirection, SortField, SortState,
+    Tab, WorkspaceState, reconcile_selection, sort_files, tree_ancestor_paths, tree_path_key,
 };
 mod ui;
 use ui::{
-    InputElement, action_button, computer_button, dialog_button, icon_button, menu_item,
-    menu_items_for, new_tab_button, parent_button, refresh_button, resize_handle, tab_button,
-    tab_name, tab_scroll_button, toolbar_divider, window_control_button,
+    InputElement, MenuAction, UiIntent, UiProjection, action_button, computer_button,
+    dialog_button, icon_button, menu_item, menu_items_for, new_tab_button, parent_button,
+    refresh_button, resize_handle, tab_button, tab_name, tab_scroll_button, toolbar_divider,
+    window_control_button,
 };
 mod settings;
+use platform::tray::{TrayCommand, TrayController};
 use settings::{AppSettings, Language, ThemeMode};
-mod tray;
-use tray::{TrayCommand, TrayController};
 mod update;
+use update::{UpdatePhase, UpdateState};
 
-const PRIMARY_YAZI_TAB: usize = 1;
 const TAB_DEFAULT_WIDTH: f32 = 160.0;
 const TAB_MIN_WIDTH: f32 = 112.0;
 const TAB_BAR_BUTTON_WIDTH: f32 = 32.0;
@@ -147,31 +146,7 @@ fn load_settings_or_exit() -> AppSettings {
         Ok(settings) => settings,
         Err(error) => {
             let message = format!("设置文件无效：{error}");
-            #[cfg(windows)]
-            {
-                use windows_sys::Win32::UI::WindowsAndMessaging::{
-                    MB_ICONERROR, MB_OK, MessageBoxW,
-                };
-                let text: Vec<u16> = std::ffi::OsStr::new(&message)
-                    .encode_wide()
-                    .chain(std::iter::once(0))
-                    .collect();
-                let title: Vec<u16> = std::ffi::OsStr::new("yazi-gui")
-                    .encode_wide()
-                    .chain(std::iter::once(0))
-                    .collect();
-                unsafe {
-                    MessageBoxW(
-                        std::ptr::null_mut(),
-                        text.as_ptr(),
-                        title.as_ptr(),
-                        MB_OK | MB_ICONERROR,
-                    );
-                }
-                std::process::exit(1);
-            }
-            #[cfg(not(windows))]
-            panic!("{message}");
+            platform::window::show_error_message(&message);
         }
     }
 }
@@ -261,6 +236,23 @@ enum ShortcutAction {
 }
 
 impl ShortcutAction {
+    fn from_id(id: &str) -> Option<Self> {
+        Some(match id {
+            "shortcut-open" => Self::Open,
+            "shortcut-search" => Self::Search,
+            "shortcut-new-tab" => Self::NewTab,
+            "shortcut-close-tab" => Self::CloseTab,
+            "shortcut-delete" => Self::Delete,
+            "shortcut-rename" => Self::Rename,
+            "shortcut-copy" => Self::Copy,
+            "shortcut-cut" => Self::Cut,
+            "shortcut-paste" => Self::Paste,
+            "shortcut-new-file" => Self::NewFile,
+            "shortcut-new-dir" => Self::NewDir,
+            _ => return None,
+        })
+    }
+
     fn label(self) -> &'static str {
         match self {
             Self::Open => "打开",
@@ -458,71 +450,18 @@ struct TransferProgress {
 
 struct TransferState {
     progress: TransferProgress,
-    cancel: Arc<AtomicBool>,
-}
-
-enum UpdatePhase {
-    Idle,
-    Checking,
-    UpToDate {
-        version: String,
-    },
-    Available(update::ReleaseInfo),
-    Downloading {
-        progress: update::DownloadProgress,
-    },
-    Ready {
-        release: update::ReleaseInfo,
-        archive: PathBuf,
-        progress: update::DownloadProgress,
-    },
-    Restarting,
-    Failed(String),
-}
-
-struct UpdateState {
-    phase: UpdatePhase,
-    request_id: u64,
-    cancel: Option<Arc<AtomicBool>>,
-}
-
-impl Default for UpdateState {
-    fn default() -> Self {
-        Self {
-            phase: UpdatePhase::Idle,
-            request_id: 0,
-            cancel: None,
-        }
-    }
-}
-
-/// 右键菜单项。
-#[derive(Clone, Copy)]
-enum MenuAction {
-    Open,
-    Favorite,
-    Rename,
-    Delete,
-    Copy,
-    Cut,
-    Paste,
-    NewFile,
-    NewDir,
+    cancel: Arc<TransferControl>,
 }
 
 struct Root {
-    client: Option<YaziClient>,
-    tabs: Vec<Tab>,
-    active: usize,
-    tab_view_start: usize,
-    drive_roots: Vec<String>,
+    client: Option<YaziSession>,
+    workspace: WorkspaceState,
     clipboard: Option<Clipboard>,
     transfer: Option<TransferState>,
     pending_delete: Option<PendingDelete>,
     delete_in_progress: bool,
     menu: Option<MenuState>,
     preview_collapsed: bool,
-    folder_tree: FolderTreeState,
     focus_handle: FocusHandle,
     input_blur_subscription: Option<Subscription>,
     pending: Option<PendingOp>,
@@ -564,17 +503,13 @@ impl Root {
         };
         let mut root = Self {
             client: None,
-            tabs: vec![Tab::new(&start_dir)],
-            active: 0,
-            tab_view_start: 0,
-            drive_roots: Vec::new(),
+            workspace: WorkspaceState::new(&start_dir),
             clipboard: None,
             transfer: None,
             pending_delete: None,
             delete_in_progress: false,
             menu: None,
             preview_collapsed: true,
-            folder_tree: FolderTreeState::default(),
             focus_handle: cx.focus_handle(),
             input_blur_subscription: None,
             pending: None,
@@ -613,18 +548,105 @@ impl Root {
     }
 
     fn cur(&self) -> &Tab {
-        &self.tabs[self.active]
+        self.workspace.cur()
     }
 
     fn cur_mut(&mut self) -> &mut Tab {
-        &mut self.tabs[self.active]
+        self.workspace.cur_mut()
+    }
+
+    fn ui_projection(&self) -> UiProjection<'_> {
+        UiProjection {
+            theme: self.theme,
+            layout: self.layout,
+            language: self.language(),
+            focus_handle: self.focus_handle.clone(),
+            current_tab: self.cur(),
+            drive_roots: &self.workspace.drive_roots,
+            file_scroll: self.file_scroll.clone(),
+            settings: &self.settings,
+            shortcuts_expanded: self.shortcuts_expanded,
+            pending: &self.pending,
+            update: &self.update,
+            status: SharedString::from(self.status.clone().unwrap_or_default()),
+        }
+    }
+
+    fn dispatch_ui_intent(
+        &mut self,
+        intent: UiIntent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match intent {
+            UiIntent::ShowFiles => self.show_files(cx),
+            UiIntent::ShowSettings => self.show_settings(cx),
+            UiIntent::BeginWindowMove => self.begin_window_move(window, cx),
+            UiIntent::MinimizeWindow => self.minimize_window(window, cx),
+            UiIntent::ToggleMaximize => self.toggle_maximize(window, cx),
+            UiIntent::RequestClose => self.request_close(window, cx),
+            UiIntent::NewTab => self.new_tab(cx),
+            UiIntent::Refresh => self.refresh_current(cx),
+            UiIntent::Parent => self.go_parent(cx),
+            UiIntent::Computer => self.show_computer_view(cx),
+            UiIntent::TogglePreview => self.toggle_preview(cx),
+            UiIntent::SwitchTab(index) => self.switch_tab(index, cx),
+            UiIntent::CloseTab(index) => self.close_tab(index, cx),
+            UiIntent::ShiftTabs(delta) => self.shift_tab_view(delta, cx),
+            UiIntent::BeginResize { target, x } => self.begin_resize(target, x, cx),
+            UiIntent::EndResize => self.end_resize(cx),
+            UiIntent::MoveResize(x) => self.resize_layout(x, cx),
+            UiIntent::BeginFileScrollDrag(x) => self.begin_file_scroll_drag(x, cx),
+            UiIntent::EndFileScrollDrag => self.end_file_scroll_drag(cx),
+            UiIntent::MoveFileScrollDrag(x) => self.move_file_scroll_drag(x, cx),
+            UiIntent::ClickFile {
+                name,
+                is_dir,
+                modifiers,
+                click_count,
+            } => self.click_file(&name, is_dir, modifiers, click_count, cx),
+            UiIntent::OpenMenu { target, position } => self.open_menu(target, position, cx),
+            UiIntent::ClickBlank => self.click_blank(cx),
+            UiIntent::OpenSelected => self.open_selected(cx),
+            UiIntent::DeleteSelected => self.delete_selected(cx),
+            UiIntent::StartRename => self.start_rename(window, cx),
+            UiIntent::CopySelected => self.copy_selected(cx),
+            UiIntent::CutSelected => self.cut_selected(cx),
+            UiIntent::PasteClipboard => self.paste_clipboard(cx),
+            UiIntent::StartNewFile => self.start_new_file(window, cx),
+            UiIntent::StartNewDir => self.start_new_dir(window, cx),
+            UiIntent::ToggleCurrentFavorite => self.toggle_current_favorite(cx),
+            UiIntent::CancelTransfer => self.cancel_transfer(cx),
+            UiIntent::CancelDeleteConfirmation => self.cancel_delete_confirmation(cx),
+            UiIntent::ConfirmDelete => self.confirm_delete(cx),
+            UiIntent::ToggleSort(field) => self.toggle_sort(field, cx),
+            UiIntent::ExecuteMenu(action) => self.exec_menu_action(action, window, cx),
+            UiIntent::ToggleTheme => self.toggle_theme(cx),
+            UiIntent::CycleLanguage => self.cycle_language(cx),
+            UiIntent::SetAutostart(enabled) => self.set_autostart(enabled, cx),
+            UiIntent::ToggleShortcuts => self.toggle_shortcuts(cx),
+            UiIntent::CheckUpdates => self.check_for_updates(cx),
+            UiIntent::DownloadUpdate => self.download_update(cx),
+            UiIntent::OpenExternalUrl(url) => self.open_external_url(url, cx),
+            UiIntent::CancelUpdateDownload => self.cancel_update_download(cx),
+            UiIntent::RestartUpdate => self.restart_update(cx),
+            UiIntent::StartShortcutEdit(id) => {
+                if let Some(action) = ShortcutAction::from_id(id) {
+                    self.start_shortcut_edit(action, window, cx);
+                }
+            }
+        }
     }
 
     fn shift_tab_view(&mut self, delta: isize, cx: &mut Context<Self>) {
         if delta < 0 {
-            self.tab_view_start = self.tab_view_start.saturating_sub(delta.unsigned_abs());
+            self.workspace.tab_view_start = self
+                .workspace
+                .tab_view_start
+                .saturating_sub(delta.unsigned_abs());
         } else {
-            self.tab_view_start = self.tab_view_start.saturating_add(delta as usize);
+            self.workspace.tab_view_start =
+                self.workspace.tab_view_start.saturating_add(delta as usize);
         }
         cx.notify();
     }
@@ -802,19 +824,14 @@ impl Root {
     }
 
     fn update_is_busy(&self) -> bool {
-        matches!(
-            &self.update.phase,
-            UpdatePhase::Checking | UpdatePhase::Downloading { .. } | UpdatePhase::Restarting
-        )
+        self.update.is_busy()
     }
 
     fn check_for_updates(&mut self, cx: &mut Context<Self>) {
         if self.update_is_busy() {
             return;
         }
-        self.update.request_id = self.update.request_id.wrapping_add(1);
-        let request_id = self.update.request_id;
-        self.update.phase = UpdatePhase::Checking;
+        let request_id = self.update.begin_check();
         self.clear_status();
         cx.notify();
         cx.spawn(async move |weak, cx| {
@@ -823,28 +840,20 @@ impl Root {
                 .spawn(async { update::check_latest_release() })
                 .await;
             weak.update(cx, |this, cx| {
-                if this.update.request_id != request_id {
+                let Some(phase) = this.update.finish_check(request_id, result) else {
                     return;
-                }
-                match result {
-                    Ok(release) if update::is_newer_than_current(&release) => {
+                };
+                match phase {
+                    UpdatePhase::Available(release) => {
                         this.set_status(format!("{}: {}", this.tr("发现新版本"), release.tag_name));
-                        this.update.phase = UpdatePhase::Available(release);
                     }
-                    Ok(release) => {
-                        this.set_status(format!(
-                            "{}: {}",
-                            this.tr("已是最新版本"),
-                            release.tag_name
-                        ));
-                        this.update.phase = UpdatePhase::UpToDate {
-                            version: release.tag_name,
-                        };
+                    UpdatePhase::UpToDate { version } => {
+                        this.set_status(format!("{}: {}", this.tr("已是最新版本"), version));
                     }
-                    Err(error) => {
+                    UpdatePhase::Failed(error) => {
                         this.set_status(format!("{}: {}", this.tr("检查更新失败"), error));
-                        this.update.phase = UpdatePhase::Failed(error.to_string());
                     }
+                    _ => {}
                 }
                 cx.notify();
             })
@@ -860,16 +869,9 @@ impl Root {
         };
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = unbounded_channel();
-        self.update.request_id = self.update.request_id.wrapping_add(1);
-        let request_id = self.update.request_id;
-        self.update.cancel = Some(cancel.clone());
-        self.update.phase = UpdatePhase::Downloading {
-            progress: update::DownloadProgress {
-                downloaded: 0,
-                total: release.asset_size,
-                bytes_per_second: 0,
-            },
-        };
+        let request_id = self
+            .update
+            .begin_download(cancel.clone(), release.asset_size);
         self.set_status(self.tr("正在下载更新"));
         cx.notify();
         cx.spawn(async move |weak, cx| {
@@ -880,14 +882,8 @@ impl Root {
             let mut rx = rx;
             while let Some(progress) = rx.recv().await {
                 weak.update(cx, |this, cx| {
-                    if this.update.request_id != request_id {
+                    if !this.update.update_download_progress(request_id, progress) {
                         return;
-                    }
-                    if let UpdatePhase::Downloading {
-                        progress: current, ..
-                    } = &mut this.update.phase
-                    {
-                        *current = progress;
                     }
                     cx.notify();
                 })
@@ -895,31 +891,23 @@ impl Root {
             }
             let result = worker.await;
             weak.update(cx, |this, cx| {
-                if this.update.request_id != request_id {
+                let Some(phase) = this
+                    .update
+                    .finish_download(request_id, release.clone(), result)
+                else {
                     return;
-                }
-                this.update.cancel = None;
-                match result {
-                    Ok(update::DownloadResult::Completed(archive)) => {
-                        let progress = match &this.update.phase {
-                            UpdatePhase::Downloading { progress, .. } => *progress,
-                            _ => update::DownloadProgress::default(),
-                        };
-                        this.update.phase = UpdatePhase::Ready {
-                            release: release.clone(),
-                            archive,
-                            progress,
-                        };
+                };
+                match phase {
+                    UpdatePhase::Ready { .. } => {
                         this.set_status(this.tr("下载完成，可重启更新"));
                     }
-                    Ok(update::DownloadResult::Cancelled) => {
-                        this.update.phase = UpdatePhase::Available(release.clone());
+                    UpdatePhase::Available(_) => {
                         this.set_status(this.tr("下载已取消"));
                     }
-                    Err(error) => {
-                        this.update.phase = UpdatePhase::Failed(error.to_string());
+                    UpdatePhase::Failed(error) => {
                         this.set_status(format!("{}: {}", this.tr("下载更新失败"), error));
                     }
+                    _ => {}
                 }
                 cx.notify();
             })
@@ -929,8 +917,8 @@ impl Root {
     }
 
     fn cancel_update_download(&mut self, cx: &mut Context<Self>) {
-        if let Some(cancel) = &self.update.cancel {
-            cancel.store(true, AtomicOrdering::Relaxed);
+        if self.update.is_busy() {
+            self.update.cancel_download();
             self.set_status(self.tr("正在取消下载"));
             cx.notify();
         }
@@ -943,7 +931,7 @@ impl Root {
         };
         match update::spawn_restart_update(&archive) {
             Ok(()) => {
-                self.update.phase = UpdatePhase::Restarting;
+                self.update.begin_restart();
                 self.close_requested = true;
                 cx.notify();
                 cx.quit();
@@ -993,7 +981,7 @@ impl Root {
         self.transfer.is_some()
             || self.delete_in_progress
             || self.update_is_busy()
-            || self.tabs.iter().any(|tab| tab.refreshing)
+            || self.workspace.tabs.iter().any(|tab| tab.refreshing)
     }
 
     fn handle_window_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -1001,7 +989,7 @@ impl Root {
             return true;
         }
         if self.has_active_work() {
-            let message = if self.tabs.iter().any(|tab| tab.refreshing) {
+            let message = if self.workspace.tabs.iter().any(|tab| tab.refreshing) {
                 self.tr("正在刷新，请完成后再退出")
             } else {
                 self.tr("正在进行文件操作，请完成后再退出")
@@ -1017,87 +1005,28 @@ impl Root {
         false
     }
 
-    #[cfg(windows)]
-    fn window_hwnd(window: &Window) -> Option<windows_sys::Win32::Foundation::HWND> {
-        match HasWindowHandle::window_handle(window).ok()?.as_raw() {
-            RawWindowHandle::Win32(handle) => Some(handle.hwnd.get() as *mut std::ffi::c_void),
-            _ => None,
-        }
-    }
-
-    #[cfg(windows)]
     fn hide_native_window(&self, window: &Window) {
-        if let Some(hwnd) = Self::window_hwnd(window) {
-            unsafe {
-                windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
-                    hwnd,
-                    windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE,
-                );
-            }
-        }
+        platform::window::hide(window);
     }
-
-    #[cfg(not(windows))]
-    fn hide_native_window(&self, _window: &Window) {}
 
     fn minimize_window(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
         window.minimize_window();
     }
 
     fn toggle_maximize(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
-        #[cfg(windows)]
-        if let Some(hwnd) = Self::window_hwnd(window) {
-            let command = if window.is_maximized() {
-                windows_sys::Win32::UI::WindowsAndMessaging::SW_RESTORE
-            } else {
-                windows_sys::Win32::UI::WindowsAndMessaging::SW_MAXIMIZE
-            };
-            unsafe {
-                windows_sys::Win32::UI::WindowsAndMessaging::ShowWindowAsync(hwnd, command);
-            }
-        }
-        #[cfg(not(windows))]
-        let _ = window;
+        platform::window::toggle_maximize(window);
     }
 
     fn begin_window_move(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.pending, Some(PendingOp::Search)) {
             self.cancel_input_state();
         }
-        #[cfg(windows)]
-        if let Some(hwnd) = Self::window_hwnd(window) {
-            unsafe {
-                windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
-                windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(
-                    hwnd,
-                    windows_sys::Win32::UI::WindowsAndMessaging::WM_NCLBUTTONDOWN,
-                    windows_sys::Win32::UI::WindowsAndMessaging::HTCAPTION as usize,
-                    0,
-                );
-            }
-        }
-        #[cfg(not(windows))]
-        window.start_window_move();
+        platform::window::begin_move(window);
         cx.stop_propagation();
     }
 
     fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        #[cfg(windows)]
-        let _ = cx;
-        #[cfg(windows)]
-        if let Some(hwnd) = Self::window_hwnd(window) {
-            unsafe {
-                windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
-                    hwnd,
-                    windows_sys::Win32::UI::WindowsAndMessaging::WM_CLOSE,
-                    0,
-                    0,
-                );
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = window;
+        if !platform::window::request_close(window) {
             cx.quit();
         }
     }
@@ -1106,20 +1035,7 @@ impl Root {
         let Some(handle) = self.window_handle else {
             return;
         };
-        let _ = handle.update(cx, |_, window, _| {
-            #[cfg(windows)]
-            if let Some(hwnd) = Root::window_hwnd(window) {
-                unsafe {
-                    windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
-                        hwnd,
-                        windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW,
-                    );
-                    windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
-                }
-            }
-            #[cfg(not(windows))]
-            window.activate_window();
-        });
+        platform::window::show(handle, cx);
     }
 
     fn input_cursor_offset(&self) -> usize {
@@ -1358,14 +1274,14 @@ impl Root {
     }
 
     fn start_drive_scan(&mut self, cx: &mut Context<Self>, mark_refresh: bool) {
-        let active = self.active;
+        let active = self.workspace.active;
         let scan_id = {
-            let tab = &mut self.tabs[active];
+            let tab = &mut self.workspace.tabs[active];
             tab.drive_scan_id = tab.drive_scan_id.wrapping_add(1);
             tab.drive_scan_id
         };
         if mark_refresh {
-            self.tabs[active].refreshing = true;
+            self.workspace.tabs[active].refreshing = true;
             self.set_status(self.tr("正在刷新..."));
         }
         cx.spawn(async move |weak, cx| {
@@ -1374,12 +1290,14 @@ impl Root {
                 .spawn(async move { scan_drives() })
                 .await;
             weak.update(cx, |this, cx| {
-                if active >= this.tabs.len() || this.tabs[active].drive_scan_id != scan_id {
+                if active >= this.workspace.tabs.len()
+                    || this.workspace.tabs[active].drive_scan_id != scan_id
+                {
                     return;
                 }
-                this.drive_roots = drives;
-                let names = this.drive_roots.clone();
-                for (index, tab) in this.tabs.iter_mut().enumerate() {
+                this.workspace.drive_roots = drives;
+                let names = this.workspace.drive_roots.clone();
+                for (index, tab) in this.workspace.tabs.iter_mut().enumerate() {
                     if !tab.computer_view {
                         continue;
                     }
@@ -1392,11 +1310,11 @@ impl Root {
                     let cwd = this.cur().cwd.clone();
                     this.sync_folder_tree_to_path(&cwd, cx);
                 }
-                if mark_refresh && this.active == active {
+                if mark_refresh && this.workspace.active == active {
                     this.set_status(format!(
                         "{}，{} {}",
                         this.tr("已刷新"),
-                        this.drive_roots.len(),
+                        this.workspace.drive_roots.len(),
                         this.tr("个磁盘")
                     ));
                 }
@@ -1409,7 +1327,7 @@ impl Root {
     }
 
     fn start_folder_tree_scan(&mut self, path: String, force: bool, cx: &mut Context<Self>) {
-        let Some(scan_id) = self.folder_tree.begin_scan(&path, force) else {
+        let Some(scan_id) = self.workspace.folder_tree.begin_scan(&path, force) else {
             return;
         };
         let scan_path = path.clone();
@@ -1419,7 +1337,9 @@ impl Root {
                 .spawn(async move { scan_folder_children(Path::new(&scan_path)) })
                 .await;
             weak.update(cx, |this, cx| {
-                this.folder_tree.finish_scan(&path, scan_id, result);
+                this.workspace
+                    .folder_tree
+                    .finish_scan(&path, scan_id, result);
                 cx.notify();
             })
             .ok();
@@ -1431,7 +1351,7 @@ impl Root {
         if is_link {
             return;
         }
-        let expanded = self.folder_tree.toggle(&path);
+        let expanded = self.workspace.folder_tree.toggle(&path);
         if expanded {
             self.start_folder_tree_scan(path, false, cx);
         }
@@ -1441,15 +1361,15 @@ impl Root {
     fn sync_folder_tree_to_path(&mut self, path: &str, cx: &mut Context<Self>) {
         let ancestors = tree_ancestor_paths(path);
         for ancestor in ancestors {
-            if !self.folder_tree.is_expanded(&ancestor) {
-                self.folder_tree.toggle(&ancestor);
+            if !self.workspace.folder_tree.is_expanded(&ancestor) {
+                self.workspace.folder_tree.toggle(&ancestor);
             }
             self.start_folder_tree_scan(ancestor, false, cx);
         }
     }
 
     fn refresh_folder_tree(&mut self, cx: &mut Context<Self>) {
-        let mut paths = self.folder_tree.expanded_paths();
+        let mut paths = self.workspace.folder_tree.expanded_paths();
         if !self.cur().computer_view {
             paths.push(self.cur().cwd.clone());
         }
@@ -1467,7 +1387,7 @@ impl Root {
             return;
         }
         self.clear_status();
-        match self.send_checked(&["cd", target.as_str()]) {
+        match self.send_checked(&target) {
             Ok(()) => {
                 self.cancel_input_state();
                 self.menu = None;
@@ -1539,7 +1459,7 @@ impl Root {
 
     fn start_yazi(&mut self, cx: &mut Context<Self>) {
         let cwd = self.cur().cwd.clone();
-        match YaziClient::spawn(Path::new(&cwd)) {
+        match YaziSession::spawn(Path::new(&cwd)) {
             Ok((client, mut rx)) => {
                 self.client = Some(client);
                 cx.spawn(async move |weak, cx| {
@@ -1561,10 +1481,7 @@ impl Root {
 
     fn on_event(&mut self, event: YaziEvent, cx: &mut Context<Self>) {
         match event {
-            YaziEvent::Cd { tab: yazi_tab, url } => {
-                if !is_primary_yazi_tab(yazi_tab) {
-                    return;
-                }
+            YaziEvent::Cd { url } => {
                 if !self.cur().computer_view {
                     self.cancel_input_state();
                     let previous_cwd = tree_path_key(&self.cur().cwd);
@@ -1579,41 +1496,9 @@ impl Root {
                     self.sync_folder_tree_to_path(&cwd, cx);
                 }
             }
-            YaziEvent::Hover { tab: yazi_tab, .. } => {
-                if !is_primary_yazi_tab(yazi_tab) {
-                    return;
-                }
-            }
-            YaziEvent::GuiFiles { cwd, files, .. } => {
-                if !self.cur().computer_view
-                    && tree_path_key(&self.cur().cwd) == tree_path_key(&cwd)
-                {
-                    let search_active = self
-                        .cur()
-                        .search
-                        .as_ref()
-                        .is_some_and(|search| !search.query.is_empty());
-                    let refreshed = {
-                        let tab = self.cur_mut();
-                        let refreshed = refresh_request_matches(tab.refreshing, &tab.cwd, &cwd);
-                        tab.cwd = cwd;
-                        tab.files = files;
-                        sort_files(&mut tab.files, tab.sort);
-                        let names = tab
-                            .files
-                            .iter()
-                            .map(|file| file.name.clone())
-                            .collect::<Vec<_>>();
-                        if refreshed {
-                            tab.invalidate_refresh();
-                        }
-                        (refreshed, names)
-                    };
-                    if !search_active {
-                        let tab = self.cur_mut();
-                        reconcile_selection(&mut tab.selected, &mut tab.anchor, &refreshed.1);
-                    }
-                    if refreshed.0 {
+            YaziEvent::GuiFiles { cwd, files } => {
+                if let Some(refreshed) = self.workspace.apply_gui_files(cwd, files) {
+                    if refreshed {
                         self.set_status(format!(
                             "{}，{} {}",
                             self.tr("已刷新"),
@@ -1626,7 +1511,6 @@ impl Root {
                     self.sync_folder_tree_to_path(&current_cwd, cx);
                 }
             }
-            _ => {}
         }
         let _ = cx;
     }
@@ -1820,7 +1704,7 @@ impl Root {
     }
 
     fn load_preview(&mut self, path: String, is_dir: bool, size: u64, cx: &mut Context<Self>) {
-        let tab_index = self.active;
+        let tab_index = self.workspace.active;
         if is_dir {
             self.cur_mut().preview = Preview::Dir;
             return;
@@ -1855,11 +1739,12 @@ impl Root {
 
             weak.update(cx, |this, cx| {
                 let valid = this
+                    .workspace
                     .tabs
                     .get(tab_index)
                     .is_some_and(|tab| tab.preview_path.as_deref() == Some(path.as_str()));
                 if valid {
-                    this.tabs[tab_index].preview = match result {
+                    this.workspace.tabs[tab_index].preview = match result {
                         Some((text, Some(highlights))) => Preview::Code { text, highlights },
                         Some((text, None)) => Preview::Text(text),
                         None => Preview::Binary { size },
@@ -1874,16 +1759,16 @@ impl Root {
 
     // ---- 基础导航与操作 ----
 
-    fn send_checked(&self, action: &[&str]) -> anyhow::Result<()> {
+    fn send_checked(&self, cwd: &str) -> anyhow::Result<()> {
         let client = self
             .client
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("yazi client unavailable"))?;
-        client.send(action).map(|_| ())
+            .ok_or_else(|| anyhow::anyhow!("yazi session unavailable"))?;
+        client.change_directory(cwd).map(|_| ())
     }
 
-    fn send(&self, action: &[&str]) {
-        let _ = self.send_checked(action);
+    fn send(&self, cwd: &str) {
+        let _ = self.send_checked(cwd);
     }
 
     fn refresh_current(&mut self, cx: &mut Context<Self>) {
@@ -1921,45 +1806,29 @@ impl Root {
             cx.notify();
             return;
         }
-        let tab_index = self.active;
-        let cwd = self.cur().cwd.clone();
-        let Some(client_id) = self
-            .client
-            .as_ref()
-            .map(|client| client.client_id().to_string())
-        else {
-            self.set_status(self.tr("刷新失败: yazi client unavailable"));
+        let Some(session) = self.client.as_ref().map(YaziSession::handle) else {
+            self.set_status(self.tr("刷新失败: yazi session unavailable"));
             cx.notify();
             return;
         };
-        let request_id = {
-            let tab = self.cur_mut();
-            tab.refresh_request_id = tab.refresh_request_id.wrapping_add(1);
-            tab.refreshing = true;
-            tab.refresh_request_id
+        let Some(request) = self.workspace.begin_refresh() else {
+            self.set_status(self.tr("正在刷新..."));
+            cx.notify();
+            return;
         };
+        let cwd = request.cwd.clone();
         self.set_status(self.tr("正在刷新..."));
         cx.spawn(async move |weak, cx| {
             let command_cwd = cwd.clone();
             let result = cx
                 .background_executor()
-                .spawn(async move {
-                    YaziClient::send_with_client_id(&client_id, &["cd".to_string(), command_cwd])
-                })
+                .spawn(async move { session.change_directory(command_cwd) })
                 .await;
             weak.update(cx, |this, cx| {
-                if tab_index >= this.tabs.len()
-                    || !refresh_token_matches(
-                        this.tabs[tab_index].refreshing,
-                        this.tabs[tab_index].refresh_request_id,
-                        request_id,
-                    )
-                    || tree_path_key(&this.tabs[tab_index].cwd) != tree_path_key(&cwd)
-                {
+                if !this.workspace.finish_refresh(&request) {
                     return;
                 }
-                this.tabs[tab_index].refreshing = false;
-                if this.active == tab_index {
+                if this.workspace.active == request.tab_index {
                     match result {
                         Ok(_) => this.set_status(this.tr("已刷新")),
                         Err(error) => {
@@ -1986,12 +1855,12 @@ impl Root {
             self.cur_mut().selected.clear();
             self.cur_mut().anchor = None;
             self.cur_mut().clear_preview();
-            self.send(&["cd", name]);
+            self.send(name);
             return;
         }
         self.cur_mut().invalidate_refresh();
         let path = std::path::Path::new(&self.cur().cwd).join(name);
-        self.send(&["cd", &path.to_string_lossy()]);
+        self.send(&path.to_string_lossy());
     }
 
     fn show_computer_view(&mut self, cx: &mut Context<Self>) {
@@ -2023,7 +1892,7 @@ impl Root {
             return;
         }
         self.cur_mut().invalidate_refresh();
-        self.send(&["cd", ".."]);
+        self.send("..");
     }
 
     fn open_path(&self, name: &str, cx: &mut Context<Self>) {
@@ -2135,7 +2004,7 @@ impl Root {
             weak.update(cx, |this, cx| {
                 this.delete_in_progress = false;
                 if summary.success > 0 && this.cur().cwd == cwd && !this.cur().computer_view {
-                    this.send(&["cd", cwd.as_str()]);
+                    this.send(cwd.as_str());
                 }
                 this.set_status(delete_status(&summary));
                 cx.notify();
@@ -2260,7 +2129,7 @@ impl Root {
                         this.clipboard = None;
                     }
                     if success > 0 && this.cur().cwd == dest {
-                        this.send(&["cd", dest.as_str()]);
+                        this.send(dest.as_str());
                     }
                     this.set_status(operation_status("粘贴", success, failed));
                     cx.notify();
@@ -2272,7 +2141,7 @@ impl Root {
         }
 
         let total_items = paths.len();
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(TransferControl::new());
         let (tx, rx) = unbounded_channel::<TransferUpdate>();
         let refresh_cwd = self.cur().cwd.clone();
         self.transfer = Some(TransferState {
@@ -2291,7 +2160,11 @@ impl Root {
             let tx2 = tx.clone();
             let worker_dest = refresh_cwd.clone();
             let worker = cx.background_executor().spawn(async move {
-                let outcome = copy_paths_with_progress(&paths, &worker_dest, &cancel, &tx2);
+                let progress_tx = tx2.clone();
+                let outcome =
+                    copy_paths_with_progress(&paths, &worker_dest, &cancel, move |update| {
+                        let _ = progress_tx.send(update);
+                    });
                 let _ = tx2.send(TransferUpdate::Finished(outcome));
             });
             let mut rx: UnboundedReceiver<TransferUpdate> = rx;
@@ -2330,7 +2203,7 @@ impl Root {
 
     fn cancel_transfer(&mut self, cx: &mut Context<Self>) {
         if let Some(transfer) = &self.transfer {
-            transfer.cancel.store(true, AtomicOrdering::Relaxed);
+            transfer.cancel.cancel();
             self.set_status("正在取消粘贴...");
             cx.notify();
         }
@@ -2341,20 +2214,20 @@ impl Root {
         match outcome {
             TransferOutcome::Completed { success } => {
                 if success > 0 && self.cur().cwd == dest {
-                    self.send(&["cd", dest]);
+                    self.send(&dest);
                 }
                 self.set_status(format!("粘贴完成 {} 项", success));
             }
             TransferOutcome::Cancelled { success } => {
                 self.clipboard = None;
                 if success > 0 && self.cur().cwd == dest {
-                    self.send(&["cd", dest]);
+                    self.send(&dest);
                 }
                 self.set_status(format!("粘贴已取消，完成 {} 项", success));
             }
             TransferOutcome::Failed { success, message } => {
                 if success > 0 && self.cur().cwd == dest {
-                    self.send(&["cd", dest]);
+                    self.send(&dest);
                 }
                 self.set_status(format!("粘贴失败，已完成 {} 项：{}", success, message));
             }
@@ -2539,18 +2412,18 @@ impl Root {
     fn switch_tab(&mut self, i: usize, cx: &mut Context<Self>) {
         self.cancel_input_state();
         self.clear_status();
-        if i == self.active || i >= self.tabs.len() {
+        if i == self.workspace.active || i >= self.workspace.tabs.len() {
             return;
         }
-        self.tabs[self.active].invalidate_refresh();
-        self.active = i;
-        self.tab_view_start = i;
+        self.workspace.tabs[self.workspace.active].invalidate_refresh();
+        self.workspace.active = i;
+        self.workspace.tab_view_start = i;
         self.cur_mut().clear_preview();
-        if self.tabs[i].computer_view {
+        if self.workspace.tabs[i].computer_view {
             self.start_drive_scan(cx, true);
         } else {
-            let cwd = self.tabs[i].cwd.clone();
-            self.send(&["cd", cwd.as_str()]);
+            let cwd = self.workspace.tabs[i].cwd.clone();
+            self.send(cwd.as_str());
             self.sync_folder_tree_to_path(&cwd, cx);
         }
         self.reset_file_scroll();
@@ -2563,10 +2436,10 @@ impl Root {
         self.cur_mut().invalidate_refresh();
         let mut tab = Tab::new("");
         tab.computer_view = true;
-        self.tabs.push(tab);
-        self.active = self.tabs.len() - 1;
-        self.tab_view_start = self.active;
-        self.folder_tree.reset();
+        self.workspace.tabs.push(tab);
+        self.workspace.active = self.workspace.tabs.len() - 1;
+        self.workspace.tab_view_start = self.workspace.active;
+        self.workspace.folder_tree.reset();
         self.cur_mut().clear_preview();
         self.reset_file_scroll();
         self.start_drive_scan(cx, false);
@@ -2576,28 +2449,28 @@ impl Root {
     fn close_tab(&mut self, i: usize, cx: &mut Context<Self>) {
         self.cancel_input_state();
         self.clear_status();
-        if i >= self.tabs.len() {
+        if i >= self.workspace.tabs.len() {
             return;
         }
-        if self.tabs.len() == 1 {
+        if self.workspace.tabs.len() == 1 {
             cx.quit();
             return;
         }
-        if i < self.tab_view_start {
-            self.tab_view_start = self.tab_view_start.saturating_sub(1);
+        if i < self.workspace.tab_view_start {
+            self.workspace.tab_view_start = self.workspace.tab_view_start.saturating_sub(1);
         }
-        self.tabs.remove(i);
-        let len = self.tabs.len();
-        self.tab_view_start = self.tab_view_start.min(len - 1);
-        if self.active > i {
-            self.active -= 1;
+        self.workspace.tabs.remove(i);
+        let len = self.workspace.tabs.len();
+        self.workspace.tab_view_start = self.workspace.tab_view_start.min(len - 1);
+        if self.workspace.active > i {
+            self.workspace.active -= 1;
         }
-        if self.active >= len {
-            self.active = len - 1;
+        if self.workspace.active >= len {
+            self.workspace.active = len - 1;
         }
         self.cur_mut().clear_preview();
-        let cwd = self.tabs[self.active].cwd.clone();
-        self.send(&["cd", cwd.as_str()]);
+        let cwd = self.workspace.tabs[self.workspace.active].cwd.clone();
+        self.send(cwd.as_str());
         self.sync_folder_tree_to_path(&cwd, cx);
         cx.notify();
     }
@@ -2736,13 +2609,12 @@ impl Root {
     }
 
     fn start_search_scan(&mut self, cx: &mut Context<Self>) {
-        let tab_index = self.active;
-        let Some(search) = &self.tabs[tab_index].search else {
+        let Some(request) = self.workspace.begin_search_request() else {
             return;
         };
-        let cwd = search.cwd.clone();
-        let query = search.query.clone();
-        let generation = search.generation;
+        let tab_index = request.tab_index;
+        let cwd = request.cwd.clone();
+        let query = request.query.clone();
         cx.spawn(async move |weak, cx| {
             let scan_cwd = cwd.clone();
             let result = cx
@@ -2750,38 +2622,21 @@ impl Root {
                 .spawn(async move { search_directory(Path::new(&scan_cwd), &query) })
                 .await;
             weak.update(cx, |this, cx| {
-                let valid = this.tabs.get(tab_index).is_some_and(|tab| {
-                    tab.search
-                        .as_ref()
-                        .is_some_and(|search| search.generation == generation && search.cwd == cwd)
-                });
-                if !valid {
-                    return;
-                }
                 match result {
-                    Ok(mut results) => {
-                        sort_files(&mut results, this.tabs[tab_index].sort);
-                        let names = results
-                            .iter()
-                            .map(|file| file.name.clone())
-                            .collect::<Vec<_>>();
-                        if let Some(search) = this.tabs[tab_index].search.as_mut() {
-                            search.results = results;
-                            search.scanning = false;
+                    Ok(results) => {
+                        if !this.workspace.apply_search_results(&request, results) {
+                            return;
                         }
-                        let tab = &mut this.tabs[tab_index];
-                        reconcile_selection(&mut tab.selected, &mut tab.anchor, &names);
-                        if this.active == tab_index {
+                        if this.workspace.active == tab_index {
                             this.clear_status();
                             this.reconcile_preview();
                         }
                     }
                     Err(error) => {
-                        if let Some(search) = this.tabs[tab_index].search.as_mut() {
-                            search.results.clear();
-                            search.scanning = false;
+                        if !this.workspace.fail_search(&request) {
+                            return;
                         }
-                        if this.active == tab_index {
+                        if this.workspace.active == tab_index {
                             this.set_status(format!("{}: {}", this.tr("搜索失败"), error));
                         }
                     }
@@ -2861,7 +2716,7 @@ impl Root {
                     }
                 }
                 if succeeded {
-                    this.send(&["cd", cwd.as_str()]);
+                    this.send(cwd.as_str());
                 }
                 cx.notify();
             })
@@ -2924,7 +2779,7 @@ impl Root {
         if shortcut_matches(&self.settings.shortcuts.new_tab, ks) {
             self.new_tab(cx);
         } else if shortcut_matches(&self.settings.shortcuts.close_tab, ks) {
-            self.close_tab(self.active, cx);
+            self.close_tab(self.workspace.active, cx);
         } else if shortcut_matches(&self.settings.shortcuts.open, ks) {
             self.open_selected(cx);
         } else if shortcut_matches(&self.settings.shortcuts.search, ks) {
@@ -3067,7 +2922,10 @@ impl Root {
     fn folder_tree_pane(&self, cx: &mut Context<Root>) -> AnyElement {
         let theme = self.theme;
         let computer_view = self.cur().computer_view;
-        let rows = self.folder_tree.visible_rows(&self.drive_roots);
+        let rows = self
+            .workspace
+            .folder_tree
+            .visible_rows(&self.workspace.drive_roots);
         let items = uniform_list(
             "folder-tree-items",
             rows.len(),
@@ -3145,7 +3003,7 @@ impl Root {
                 .into_any_element(),
             FolderTreeRowKind::Folder(entry) => {
                 let is_link = entry.is_link;
-                let expanded = self.folder_tree.is_expanded(&entry.path);
+                let expanded = self.workspace.folder_tree.is_expanded(&entry.path);
                 let selected = !self.cur().computer_view
                     && tree_path_key(&self.cur().cwd) == tree_path_key(&entry.path);
                 let favorite = self.is_favorite(&entry.path);
@@ -3333,7 +3191,11 @@ impl Root {
     }
 
     fn settings_page(&self, cx: &mut Context<Root>) -> AnyElement {
-        ui::settings_page::render(self, cx)
+        let projection = self.ui_projection();
+        let titlebar = self.titlebar(cx);
+        let input_bar = self.input_bar(cx);
+        let status_bar = self.status_bar(cx, projection.theme, projection.status.clone());
+        ui::settings_page::render(&projection, cx, titlebar, input_bar, status_bar)
     }
 
     fn address_bar(&self, cx: &mut Context<Self>, cwd: SharedString) -> AnyElement {
@@ -3413,7 +3275,7 @@ impl Root {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _event, window, cx| {
-                            this.begin_window_move(window, cx);
+                            this.dispatch_ui_intent(UiIntent::BeginWindowMove, window, cx);
                         }),
                     )
                     .child(div().text_sm().child("yazi-gui")),
@@ -3424,7 +3286,7 @@ impl Root {
                 "titlebar-settings",
                 "⚙",
                 self.tr("设置"),
-                |this, _window, cx| this.show_settings(cx),
+                UiIntent::ShowSettings,
             ))
             .child(window_control_button(
                 cx,
@@ -3432,7 +3294,7 @@ impl Root {
                 "titlebar-minimize",
                 "−",
                 self.tr("最小化"),
-                |this, window, cx| this.minimize_window(window, cx),
+                UiIntent::MinimizeWindow,
             ))
             .child(window_control_button(
                 cx,
@@ -3440,7 +3302,7 @@ impl Root {
                 "titlebar-maximize",
                 "□",
                 self.tr("最大化"),
-                |this, window, cx| this.toggle_maximize(window, cx),
+                UiIntent::ToggleMaximize,
             ))
             .child(window_control_button(
                 cx,
@@ -3448,25 +3310,30 @@ impl Root {
                 "titlebar-close",
                 "×",
                 self.tr("关闭"),
-                |this, window, cx| this.request_close(window, cx),
+                UiIntent::RequestClose,
             ))
             .into_any_element()
     }
 
     fn tab_bar(&mut self, window_width: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
-        let metrics = tab_bar_metrics(window_width, self.tabs.len());
-        self.tab_view_start =
-            tab_view_start(self.tabs.len(), metrics.visible_count, self.tab_view_start);
-        let end = (self.tab_view_start + metrics.visible_count).min(self.tabs.len());
-        let can_scroll_left = self.tab_view_start > 0;
-        let can_scroll_right = end < self.tabs.len();
+        let metrics = tab_bar_metrics(window_width, self.workspace.tabs.len());
+        self.workspace.tab_view_start = tab_view_start(
+            self.workspace.tabs.len(),
+            metrics.visible_count,
+            self.workspace.tab_view_start,
+        );
+        let end =
+            (self.workspace.tab_view_start + metrics.visible_count).min(self.workspace.tabs.len());
+        let can_scroll_left = self.workspace.tab_view_start > 0;
+        let can_scroll_right = end < self.workspace.tabs.len();
         let language = self.language();
         let visible_tabs: Vec<_> = self
+            .workspace
             .tabs
             .iter()
             .enumerate()
-            .skip(self.tab_view_start)
+            .skip(self.workspace.tab_view_start)
             .take(metrics.visible_count)
             .map(|(i, tab)| {
                 let name = if tab.computer_view {
@@ -3474,7 +3341,7 @@ impl Root {
                 } else {
                     tab_name(&tab.cwd)
                 };
-                (i, SharedString::from(name), i == self.active)
+                (i, SharedString::from(name), i == self.workspace.active)
             })
             .collect();
 
@@ -3504,7 +3371,7 @@ impl Root {
                 "‹",
                 settings::translate(language, "向左滚动标签页"),
                 can_scroll_left,
-                |this, _window, cx| this.shift_tab_view(-1, cx),
+                UiIntent::ShiftTabs(-1),
             ));
         }
 
@@ -3518,7 +3385,7 @@ impl Root {
                 "›",
                 settings::translate(language, "向右滚动标签页"),
                 can_scroll_right,
-                |this, _window, cx| this.shift_tab_view(1, cx),
+                UiIntent::ShiftTabs(1),
             ));
         }
 
@@ -3722,7 +3589,7 @@ impl Render for Root {
         });
         let status = SharedString::from(self.status.clone().unwrap_or_else(|| {
             if computer_view {
-                format!("{} {}", self.drive_roots.len(), self.tr("个磁盘"))
+                format!("{} {}", self.workspace.drive_roots.len(), self.tr("个磁盘"))
             } else if self
                 .cur()
                 .search
@@ -3767,7 +3634,7 @@ impl Render for Root {
                 "btn-open",
                 "↗",
                 self.tr("打开"),
-                |this, _w, cx| this.open_selected(cx),
+                UiIntent::OpenSelected,
             ))
             .child(icon_button(
                 cx,
@@ -3775,7 +3642,7 @@ impl Render for Root {
                 "btn-delete",
                 "⌫",
                 self.tr("删除"),
-                |this, _w, cx| this.delete_selected(cx),
+                UiIntent::DeleteSelected,
             ))
             .child(icon_button(
                 cx,
@@ -3783,7 +3650,7 @@ impl Render for Root {
                 "btn-rename",
                 "✎",
                 self.tr("重命名"),
-                |this, w, cx| this.start_rename(w, cx),
+                UiIntent::StartRename,
             ))
             .child(icon_button(
                 cx,
@@ -3791,7 +3658,7 @@ impl Render for Root {
                 "btn-yank",
                 "⧉",
                 self.tr("复制"),
-                |this, _w, cx| this.copy_selected(cx),
+                UiIntent::CopySelected,
             ))
             .child(icon_button(
                 cx,
@@ -3799,7 +3666,7 @@ impl Render for Root {
                 "btn-cut",
                 "✂",
                 self.tr("剪切"),
-                |this, _w, cx| this.cut_selected(cx),
+                UiIntent::CutSelected,
             ))
             .child(icon_button(
                 cx,
@@ -3807,7 +3674,7 @@ impl Render for Root {
                 "btn-paste",
                 "📋",
                 self.tr("粘贴"),
-                |this, _w, cx| this.paste_clipboard(cx),
+                UiIntent::PasteClipboard,
             ))
             .child(toolbar_divider(theme))
             .child(icon_button(
@@ -3816,7 +3683,7 @@ impl Render for Root {
                 "btn-newfile",
                 "📄+",
                 self.tr("新建文件"),
-                |this, w, cx| this.start_new_file(w, cx),
+                UiIntent::StartNewFile,
             ))
             .child(icon_button(
                 cx,
@@ -3824,7 +3691,7 @@ impl Render for Root {
                 "btn-newdir",
                 "📁+",
                 self.tr("新建文件夹"),
-                |this, w, cx| this.start_new_dir(w, cx),
+                UiIntent::StartNewDir,
             ))
             .child(toolbar_divider(theme))
             .child(icon_button(
@@ -3837,7 +3704,7 @@ impl Render for Root {
                 } else {
                     "折叠预览"
                 }),
-                |this, _w, cx| this.toggle_preview(cx),
+                UiIntent::TogglePreview,
             ))
             .child(div().flex_1());
 
@@ -3883,7 +3750,7 @@ impl Render for Root {
                         "btn-favorite-current",
                         favorite_label,
                         favorite_tooltip,
-                        |this, _w, cx| this.toggle_current_favorite(cx),
+                        UiIntent::ToggleCurrentFavorite,
                     ))
                     .child(self.address_bar(cx, cwd))
                     .child(div().flex_1())
@@ -3961,7 +3828,7 @@ impl Root {
                 theme,
                 "btn-cancel-transfer",
                 "取消",
-                |this, _window, cx| this.cancel_transfer(cx),
+                UiIntent::CancelTransfer,
             ))
             .into_any_element()
     }
@@ -3991,8 +3858,8 @@ impl Root {
             .items_center()
             .justify_center()
             .id("delete-confirmation-mask")
-            .on_click(cx.listener(|this, _event, _window, cx| {
-                this.cancel_delete_confirmation(cx);
+            .on_click(cx.listener(|this, _event, window, cx| {
+                this.dispatch_ui_intent(UiIntent::CancelDeleteConfirmation, window, cx);
             }))
             .child(
                 div()
@@ -4023,14 +3890,14 @@ impl Root {
                                 theme,
                                 "btn-cancel-delete",
                                 self.tr("取消"),
-                                |this, _window, cx| this.cancel_delete_confirmation(cx),
+                                UiIntent::CancelDeleteConfirmation,
                             ))
                             .child(dialog_button(
                                 cx,
                                 theme,
                                 "btn-confirm-delete",
                                 self.tr("确认永久删除"),
-                                |this, _window, cx| this.confirm_delete(cx),
+                                UiIntent::ConfirmDelete,
                             )),
                     ),
             )
@@ -4038,11 +3905,13 @@ impl Root {
     }
 
     fn file_list(&self, cx: &Context<Root>) -> impl IntoElement {
-        ui::files_page::file_list(self, cx)
+        let projection = self.ui_projection();
+        ui::files_page::file_list(&projection, cx)
     }
 
     fn preview_pane(&self) -> impl IntoElement {
-        ui::files_page::preview_pane(self)
+        let projection = self.ui_projection();
+        ui::files_page::preview_pane(&projection)
     }
 }
 
@@ -4180,27 +4049,6 @@ fn shortcut_matches(configured: &str, keystroke: &Keystroke) -> bool {
         && alt == keystroke.modifiers.alt
         && platform == keystroke.modifiers.platform
         && function == keystroke.modifiers.function
-}
-
-fn refresh_request_matches(refreshing: bool, request_cwd: &str, event_cwd: &str) -> bool {
-    refreshing && tree_path_key(request_cwd) == tree_path_key(event_cwd)
-}
-
-fn is_primary_yazi_tab(tab: usize) -> bool {
-    tab == PRIMARY_YAZI_TAB
-}
-
-fn refresh_token_matches(refreshing: bool, current_id: u64, request_id: u64) -> bool {
-    refreshing && current_id == request_id
-}
-
-fn operation_status(label: &str, success: usize, failed: usize) -> String {
-    match (success, failed) {
-        (0, 0) => format!("{}未执行", label),
-        (_, 0) => format!("{}完成 {} 项", label, success),
-        (0, _) => format!("{}失败 {} 项", label, failed),
-        _ => format!("{}完成 {} 项，失败 {} 项", label, success, failed),
-    }
 }
 
 fn is_image_file(path: &str) -> bool {
@@ -4418,23 +4266,19 @@ mod tests {
     use super::{
         APPLICATION_ICON_ASSET, AppAssets, DeleteSummary, FileEntry, LayoutState,
         MODIFIED_WIDTH_MIN, PREVIEW_WIDTH_MAX, ResizeTarget, SortDirection, SortField, SortState,
-        TAB_DEFAULT_WIDTH, TAB_MIN_WIDTH, TREE_WIDTH_MIN, TransferOutcome, clamp_layout_width,
-        copy_paths_with_progress, delete_status, favorite_path_key, format_mtime,
-        horizontal_scrollbar_metrics, is_primary_yazi_tab, is_unc_path, keystroke_to_shortcut,
+        TAB_DEFAULT_WIDTH, TAB_MIN_WIDTH, TREE_WIDTH_MIN, TransferControl, TransferOutcome,
+        clamp_layout_width, copy_paths_with_progress, delete_status, favorite_path_key,
+        format_mtime, horizontal_scrollbar_metrics, is_unc_path, keystroke_to_shortcut,
         normalize_favorite_path, normalize_shortcut, normalize_single_path, permanent_delete,
-        reconcile_selection, refresh_request_matches, refresh_token_matches, resolve_address_path,
-        scan_folder_children, search_directory, sort_files, tab_bar_metrics, tab_view_start,
-        tree_ancestor_paths, tree_path_key,
+        reconcile_selection, resolve_address_path, scan_folder_children, search_directory,
+        sort_files, tab_bar_metrics, tab_view_start, tree_ancestor_paths, tree_path_key,
     };
     use std::fs;
-    use std::sync::atomic::AtomicBool;
-    use tokio::sync::mpsc::unbounded_channel;
 
     fn entry(name: &str, is_dir: bool, size: u64, mtime: f64) -> FileEntry {
         FileEntry {
             name: name.to_string(),
             is_dir,
-            is_hidden: false,
             size,
             mtime,
         }
@@ -4627,17 +4471,17 @@ mod tests {
         let source = source_dir.join("data.bin");
         fs::write(&source, vec![7u8; 2_500_000]).unwrap();
 
-        let (tx, mut rx) = unbounded_channel();
+        let control = TransferControl::new();
+        let mut updates = Vec::new();
         let outcome = copy_paths_with_progress(
             &[source.to_string_lossy().into_owned()],
             &destination_dir.to_string_lossy(),
-            &AtomicBool::new(false),
-            &tx,
+            &control,
+            |update| updates.push(update),
         );
-        drop(tx);
 
         let mut saw_byte_progress = false;
-        while let Ok(update) = rx.try_recv() {
+        for update in updates {
             if let super::TransferUpdate::Progress {
                 completed_bytes, ..
             } = update
@@ -4670,55 +4514,19 @@ mod tests {
         let source = source_dir.join("data.bin");
         fs::write(&source, vec![3u8; 32]).unwrap();
 
-        let (tx, _rx) = unbounded_channel();
-        let cancel = AtomicBool::new(true);
+        let cancel = TransferControl::new();
+        cancel.cancel();
         let outcome = copy_paths_with_progress(
             &[source.to_string_lossy().into_owned()],
             &destination_dir.to_string_lossy(),
             &cancel,
-            &tx,
+            |_| {},
         );
 
         assert!(matches!(outcome, TransferOutcome::Cancelled { success: 0 }));
         assert!(!destination_dir.join("data.bin").exists());
         assert_eq!(fs::read_dir(&destination_dir).unwrap().count(), 0);
         fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn refresh_completes_only_for_the_requested_directory() {
-        assert!(refresh_request_matches(
-            true,
-            r"D:\Projects\gui_for_yazi",
-            r"D:\Projects\gui_for_yazi"
-        ));
-        assert!(!refresh_request_matches(
-            true,
-            r"D:\Projects\gui_for_yazi",
-            r"D:\Projects\gui_for_yazi\assets"
-        ));
-        assert!(!refresh_request_matches(
-            false,
-            r"D:\Projects\gui_for_yazi",
-            r"D:\Projects\gui_for_yazi"
-        ));
-    }
-
-    #[test]
-    fn refresh_tokens_are_scoped_to_each_tab() {
-        let tab_a_request = 7;
-        let tab_b_request = 12;
-
-        assert!(refresh_token_matches(true, tab_a_request, tab_a_request));
-        assert!(refresh_token_matches(true, tab_b_request, tab_b_request));
-        assert!(!refresh_token_matches(true, tab_a_request, tab_b_request));
-        assert!(!refresh_token_matches(false, tab_a_request, tab_a_request));
-    }
-
-    #[test]
-    fn recognizes_yazis_one_based_primary_tab() {
-        assert!(is_primary_yazi_tab(1));
-        assert!(!is_primary_yazi_tab(0));
     }
 
     #[test]

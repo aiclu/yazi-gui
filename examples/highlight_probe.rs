@@ -14,7 +14,10 @@ fn main() {
         ts.themes.len(),
         ts.themes.keys().collect::<Vec<_>>()
     );
-    println!("base16-ocean.dark exists: {}", ts.themes.contains_key("base16-ocean.dark"));
+    println!(
+        "base16-ocean.dark exists: {}",
+        ts.themes.contains_key("base16-ocean.dark")
+    );
 
     let syntax = ss.find_syntax_by_extension("rs");
     println!("rust syntax found: {:?}", syntax.map(|s| s.name.clone()));

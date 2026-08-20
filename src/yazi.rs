@@ -13,7 +13,6 @@ use std::os::windows::process::CommandExt;
 pub struct FileEntry {
     pub name: String,
     pub is_dir: bool,
-    pub is_hidden: bool,
     pub size: u64,
     pub mtime: f64,
 }
@@ -22,22 +21,12 @@ pub struct FileEntry {
 #[derive(Debug, Clone)]
 pub enum YaziEvent {
     Cd {
-        tab: usize,
-        url: Option<String>,
-    },
-    Hover {
-        tab: usize,
         url: Option<String>,
     },
     /// 完整目录列表（由 gui-files 插件通过 ps.pub 发布）。
     GuiFiles {
         cwd: String,
         files: Vec<FileEntry>,
-        hovered: Option<String>,
-    },
-    Other {
-        kind: String,
-        body: serde_json::Value,
     },
 }
 
@@ -55,8 +44,7 @@ impl YaziEvent {
         let url = body.get("url").and_then(|v| v.as_str()).map(str::to_owned);
 
         match kind {
-            "cd" => Some(YaziEvent::Cd { tab, url }),
-            "hover" => Some(YaziEvent::Hover { tab, url }),
+            "cd" if tab == 1 => Some(YaziEvent::Cd { url }),
             "gui-files" => {
                 let cwd = body
                     .get("cwd")
@@ -68,20 +56,9 @@ impl YaziEvent {
                     .and_then(|v| v.as_array())
                     .map(|arr| arr.iter().filter_map(parse_file_entry).collect())
                     .unwrap_or_default();
-                let hovered = body
-                    .get("hovered")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_owned);
-                Some(YaziEvent::GuiFiles {
-                    cwd,
-                    files,
-                    hovered,
-                })
+                Some(YaziEvent::GuiFiles { cwd, files })
             }
-            _ => Some(YaziEvent::Other {
-                kind: kind.to_string(),
-                body,
-            }),
+            _ => None,
         }
     }
 }
@@ -89,10 +66,6 @@ impl YaziEvent {
 fn parse_file_entry(v: &serde_json::Value) -> Option<FileEntry> {
     let name = v.get("name")?.as_str()?.to_string();
     let is_dir = v.get("is_dir").and_then(|x| x.as_bool()).unwrap_or(false);
-    let is_hidden = v
-        .get("is_hidden")
-        .and_then(|x| x.as_bool())
-        .unwrap_or(false);
     let size = v
         .get("size")
         .and_then(|x| x.as_u64())
@@ -102,7 +75,6 @@ fn parse_file_entry(v: &serde_json::Value) -> Option<FileEntry> {
     Some(FileEntry {
         name,
         is_dir,
-        is_hidden,
         size,
         mtime,
     })
@@ -181,13 +153,24 @@ fn hide_console(command: &mut Command) {
     let _ = command;
 }
 
-/// 一个 yazi 后端进程的客户端句柄：负责启动进程、接收事件、发送动作。
-pub struct YaziClient {
+/// 一个共享 Yazi Session：负责启动后端、接收事件和发送目录动作。
+pub struct YaziSession {
     client_id: String,
     child: Option<Child>,
 }
 
-impl YaziClient {
+#[derive(Clone)]
+pub(crate) struct YaziSessionHandle {
+    client_id: String,
+}
+
+impl YaziSessionHandle {
+    pub(crate) fn change_directory(&self, cwd: String) -> Result<String> {
+        YaziSession::send_with_client_id(&self.client_id, &[String::from("cd"), cwd])
+    }
+}
+
+impl YaziSession {
     /// 启动 yazi（隐藏、无 TTY），返回客户端句柄 + 事件接收端。
     pub fn spawn(cwd: &Path) -> Result<(Self, UnboundedReceiver<YaziEvent>)> {
         let client_id = format!(
@@ -203,7 +186,7 @@ impl YaziClient {
                 "--client-id",
                 client_id.as_str(),
                 "--local-events",
-                "cd,hover,gui-files",
+                "cd,gui-files",
             ])
             .env("YAZI_CONFIG_HOME", config_home)
             .current_dir(cwd)
@@ -240,22 +223,17 @@ impl YaziClient {
         ))
     }
 
-    /// 通过 `ya emit-to <client_id> <action...>` 向 yazi 发送一个动作。
-    pub fn send(&self, action: &[&str]) -> Result<String> {
-        Self::send_with_client_id(
-            &self.client_id,
-            &action
-                .iter()
-                .map(|value| (*value).to_string())
-                .collect::<Vec<_>>(),
-        )
+    pub fn change_directory(&self, cwd: &str) -> Result<String> {
+        Self::send_with_client_id(&self.client_id, &[String::from("cd"), cwd.to_string()])
     }
 
-    pub fn client_id(&self) -> &str {
-        &self.client_id
+    pub(crate) fn handle(&self) -> YaziSessionHandle {
+        YaziSessionHandle {
+            client_id: self.client_id.clone(),
+        }
     }
 
-    pub fn send_with_client_id(client_id: &str, action: &[String]) -> Result<String> {
+    fn send_with_client_id(client_id: &str, action: &[String]) -> Result<String> {
         let mut args = vec!["emit-to", client_id];
         args.extend(action.iter().map(String::as_str));
 
@@ -280,10 +258,48 @@ impl YaziClient {
     }
 }
 
-impl Drop for YaziClient {
+impl Drop for YaziSession {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::YaziEvent;
+
+    #[test]
+    fn parses_primary_cd_event_without_backend_tab_detail() {
+        let event = YaziEvent::parse(r#"cd,gui,ya,{"tab":1,"url":"D:/Projects"}"#);
+        match event {
+            Some(YaziEvent::Cd { url: Some(url) }) => assert_eq!(url, "D:/Projects"),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ignores_non_primary_and_unknown_events() {
+        assert!(YaziEvent::parse(r#"cd,gui,ya,{"tab":2,"url":"D:/Other"}"#).is_none());
+        assert!(YaziEvent::parse(r#"hover,gui,ya,{"tab":1,"url":"D:/Other"}"#).is_none());
+    }
+
+    #[test]
+    fn parses_only_consumed_gui_files_fields() {
+        let event = YaziEvent::parse(
+            r#"gui-files,gui,plugin,{"cwd":"D:/Projects","files":[{"name":"a.txt","is_dir":false,"is_hidden":true,"size":12,"mtime":4.5}],"hovered":"a.txt"}"#,
+        );
+        match event {
+            Some(YaziEvent::GuiFiles { cwd, files }) => {
+                assert_eq!(cwd, "D:/Projects");
+                assert_eq!(files.len(), 1);
+                assert_eq!(files[0].name, "a.txt");
+                assert!(!files[0].is_dir);
+                assert_eq!(files[0].size, 12);
+                assert_eq!(files[0].mtime, 4.5);
+            }
+            other => panic!("unexpected event: {other:?}"),
         }
     }
 }

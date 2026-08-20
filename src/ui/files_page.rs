@@ -1,36 +1,35 @@
 use super::super::*;
 use super::components::{file_row, resize_handle, sort_header};
+use super::{UiIntent, UiProjection};
 
-pub(crate) fn file_list(root: &Root, cx: &Context<Root>) -> impl IntoElement {
-    let theme = root.theme;
-    let layout = root.layout;
-    let computer_view = root.cur().computer_view;
-    let search_active = root
-        .cur()
+pub(crate) fn file_list(view: &UiProjection, cx: &Context<Root>) -> AnyElement {
+    let theme = view.theme;
+    let layout = view.layout;
+    let tab = view.current_tab;
+    let computer_view = tab.computer_view;
+    let search_active = tab
         .search
         .as_ref()
         .is_some_and(|search| !search.query.is_empty());
 
     let mut entries: Vec<(String, bool, u64, f64, bool)> = if computer_view {
-        let mut drive_entries: Vec<FileEntry> = root
+        let mut drive_entries: Vec<FileEntry> = view
             .drive_roots
             .iter()
             .map(|name| FileEntry {
                 name: name.clone(),
                 is_dir: true,
-                is_hidden: false,
                 size: 0,
                 mtime: 0.0,
             })
             .collect();
-        sort_files(&mut drive_entries, root.cur().sort);
+        sort_files(&mut drive_entries, tab.sort);
         drive_entries
             .into_iter()
             .map(|file| (file.name, file.is_dir, file.size, file.mtime, false))
             .collect()
     } else if search_active {
-        root.cur()
-            .search
+        tab.search
             .as_ref()
             .map(|search| {
                 search
@@ -41,13 +40,19 @@ pub(crate) fn file_list(root: &Root, cx: &Context<Root>) -> impl IntoElement {
             })
             .unwrap_or_default()
     } else {
-        root.cur()
-            .files
+        tab.files
             .iter()
             .map(|f| (f.name.clone(), f.is_dir, f.size, f.mtime, false))
             .collect()
     };
-    let new_item = matches!(root.pending, Some(PendingOp::NewFile | PendingOp::NewDir));
+    let new_item = matches!(view.pending, Some(PendingOp::NewFile | PendingOp::NewDir));
+    let current_cwd = tab.cwd.clone();
+    let selected_names = tab.selected.clone();
+    let rename_path = match view.pending {
+        Some(PendingOp::Rename { path }) => Some(path.clone()),
+        _ => None,
+    };
+    let file_scroll = view.file_scroll.clone();
     if new_item {
         entries.push((String::new(), false, 0, 0.0, true));
     }
@@ -60,7 +65,7 @@ pub(crate) fn file_list(root: &Root, cx: &Context<Root>) -> impl IntoElement {
         .id("file-horizontal-viewport")
         .overflow_x_scroll()
         .scrollbar_width(px(0.0))
-        .track_scroll(&root.file_scroll);
+        .track_scroll(&file_scroll);
     horizontal_viewport.style().restrict_scroll_to_axis = Some(true);
 
     let table = div()
@@ -70,7 +75,7 @@ pub(crate) fn file_list(root: &Root, cx: &Context<Root>) -> impl IntoElement {
         .h_full()
         .flex()
         .flex_col()
-        .child(file_header(root, cx, theme))
+        .child(file_header(view, cx, theme))
         .child(
             div().flex_1().w_full().h_full().child(
                 uniform_list(
@@ -81,13 +86,10 @@ pub(crate) fn file_list(root: &Root, cx: &Context<Root>) -> impl IntoElement {
                             .filter_map(|ix| {
                                 let (name, is_dir, size, mtime, new_item) =
                                     entries.get(ix)?.clone();
-                                let selected = this.cur().selected.iter().any(|item| item == &name);
-                                let inline_rename = matches!(
-                                    this.pending.as_ref(),
-                                    Some(PendingOp::Rename { path })
-                                        if Path::new(path)
-                                            == &Path::new(&this.cur().cwd).join(&name)
-                                );
+                                let selected = selected_names.iter().any(|item| item == &name);
+                                let inline_rename = rename_path.as_ref().is_some_and(|path| {
+                                    Path::new(path) == &Path::new(&current_cwd).join(&name)
+                                });
                                 let inline = new_item || inline_rename;
                                 let inline_input = inline.then(|| {
                                     let placeholder = if new_item
@@ -130,28 +132,36 @@ pub(crate) fn file_list(root: &Root, cx: &Context<Root>) -> impl IntoElement {
         .flex()
         .flex_col()
         .id("file-list")
-        .on_click(cx.listener(|this, _event, _window, cx| {
-            this.click_blank(cx);
+        .on_click(cx.listener(|this, _event, window, cx| {
+            this.dispatch_ui_intent(UiIntent::ClickBlank, window, cx);
         }))
         .on_mouse_down(
             MouseButton::Right,
-            cx.listener(|this, event: &MouseDownEvent, _window, cx| {
-                this.open_menu(None, event.position, cx);
+            cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                this.dispatch_ui_intent(
+                    UiIntent::OpenMenu {
+                        target: None,
+                        position: event.position,
+                    },
+                    window,
+                    cx,
+                );
                 cx.stop_propagation();
             }),
         )
         .child(horizontal_viewport)
-        .child(horizontal_scrollbar(root, cx, theme))
+        .child(horizontal_scrollbar(view, cx, theme))
+        .into_any_element()
 }
 
-fn horizontal_scrollbar(root: &Root, cx: &Context<Root>, theme: Theme) -> AnyElement {
-    let viewport_width = f32::from(root.file_scroll.bounds().size.width);
-    let max_offset = f32::from(root.file_scroll.max_offset().width);
+fn horizontal_scrollbar(view: &UiProjection, cx: &Context<Root>, theme: Theme) -> AnyElement {
+    let viewport_width = f32::from(view.file_scroll.bounds().size.width);
+    let max_offset = f32::from(view.file_scroll.max_offset().width);
     let Some((thumb_width, travel)) = horizontal_scrollbar_metrics(viewport_width, max_offset)
     else {
         return div().h(px(0.0)).flex_shrink_0().into_any_element();
     };
-    let offset = (-f32::from(root.file_scroll.offset().x)).clamp(0.0, max_offset);
+    let offset = (-f32::from(view.file_scroll.offset().x)).clamp(0.0, max_offset);
     let thumb_left = if max_offset == 0.0 {
         0.0
     } else {
@@ -170,14 +180,20 @@ fn horizontal_scrollbar(root: &Root, cx: &Context<Root>, theme: Theme) -> AnyEle
         .id("file-horizontal-scroll-thumb")
         .on_mouse_down(
             MouseButton::Left,
-            cx.listener(|this, event: &MouseDownEvent, _window, cx| {
-                this.begin_file_scroll_drag(f32::from(event.position.x), cx);
+            cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                this.dispatch_ui_intent(
+                    UiIntent::BeginFileScrollDrag(f32::from(event.position.x)),
+                    window,
+                    cx,
+                );
                 cx.stop_propagation();
             }),
         )
         .on_mouse_up_out(
             MouseButton::Left,
-            cx.listener(|this, _event, _window, cx| this.end_file_scroll_drag(cx)),
+            cx.listener(|this, _event, window, cx| {
+                this.dispatch_ui_intent(UiIntent::EndFileScrollDrag, window, cx)
+            }),
         )
         .on_drag(
             HorizontalScrollDrag,
@@ -186,8 +202,12 @@ fn horizontal_scrollbar(root: &Root, cx: &Context<Root>, theme: Theme) -> AnyEle
             },
         )
         .on_drag_move(cx.listener(
-            |this, event: &DragMoveEvent<HorizontalScrollDrag>, _window, cx| {
-                this.move_file_scroll_drag(f32::from(event.event.position.x), cx);
+            |this, event: &DragMoveEvent<HorizontalScrollDrag>, window, cx| {
+                this.dispatch_ui_intent(
+                    UiIntent::MoveFileScrollDrag(f32::from(event.event.position.x)),
+                    window,
+                    cx,
+                );
             },
         ));
 
@@ -202,9 +222,9 @@ fn horizontal_scrollbar(root: &Root, cx: &Context<Root>, theme: Theme) -> AnyEle
         .into_any_element()
 }
 
-pub(crate) fn file_header(root: &Root, cx: &Context<Root>, theme: Theme) -> AnyElement {
-    let sort = root.cur().sort;
-    let layout = root.layout;
+pub(crate) fn file_header(view: &UiProjection, cx: &Context<Root>, theme: Theme) -> AnyElement {
+    let sort = view.current_tab.sort;
+    let layout = view.layout;
     div()
         .w_full()
         .px_3()
@@ -218,7 +238,7 @@ pub(crate) fn file_header(root: &Root, cx: &Context<Root>, theme: Theme) -> AnyE
         .child(sort_header(
             cx,
             theme,
-            root.tr("名称"),
+            view.tr("名称"),
             SortField::Name,
             sort,
             layout.name_width,
@@ -227,7 +247,7 @@ pub(crate) fn file_header(root: &Root, cx: &Context<Root>, theme: Theme) -> AnyE
         .child(sort_header(
             cx,
             theme,
-            root.tr("修改时间"),
+            view.tr("修改时间"),
             SortField::Modified,
             sort,
             layout.modified_width,
@@ -236,7 +256,7 @@ pub(crate) fn file_header(root: &Root, cx: &Context<Root>, theme: Theme) -> AnyE
         .child(sort_header(
             cx,
             theme,
-            root.tr("大小"),
+            view.tr("大小"),
             SortField::Size,
             sort,
             layout.size_width,
@@ -245,32 +265,32 @@ pub(crate) fn file_header(root: &Root, cx: &Context<Root>, theme: Theme) -> AnyE
         .into_any_element()
 }
 
-pub(crate) fn preview_pane(root: &Root) -> impl IntoElement {
-    let tab = root.cur();
+pub(crate) fn preview_pane(view: &UiProjection) -> AnyElement {
+    let tab = view.current_tab;
     let title = SharedString::from(match tab.selected.len() {
-        0 => root.tr("预览"),
+        0 => view.tr("预览"),
         1 => tab.selected[0].clone(),
-        n => format!("{} {} {}", root.tr("已选"), n, root.tr("项")),
+        n => format!("{} {} {}", view.tr("已选"), n, view.tr("项")),
     });
 
     div()
-        .w(px(root.layout.preview_width))
+        .w(px(view.layout.preview_width))
         .flex_shrink_0()
         .h_full()
         .flex()
         .flex_col()
-        .bg(root.theme.mantle)
+        .bg(view.theme.mantle)
         .border_1()
-        .border_color(root.theme.border)
+        .border_color(view.theme.border)
         .child(
             div()
                 .px_3()
                 .py_2()
-                .bg(root.theme.crust)
+                .bg(view.theme.crust)
                 .border_1()
-                .border_color(root.theme.border)
+                .border_color(view.theme.border)
                 .text_sm()
-                .text_color(root.theme.muted)
+                .text_color(view.theme.muted)
                 .child(title),
         )
         .child(
@@ -282,28 +302,29 @@ pub(crate) fn preview_pane(root: &Root) -> impl IntoElement {
                 .overflow_y_scroll()
                 .px_3()
                 .py_2()
-                .child(preview_body(root)),
+                .child(preview_body(view)),
         )
+        .into_any_element()
 }
 
-pub(crate) fn preview_body(root: &Root) -> AnyElement {
-    match &root.cur().preview {
+pub(crate) fn preview_body(view: &UiProjection) -> AnyElement {
+    match &view.current_tab.preview {
         Preview::Empty => div()
             .text_sm()
-            .text_color(root.theme.muted)
-            .child(root.tr("单击选中文件以预览"))
+            .text_color(view.theme.muted)
+            .child(view.tr("单击选中文件以预览"))
             .into_any_element(),
         Preview::Loading => div()
             .text_sm()
-            .text_color(root.theme.muted)
-            .child(root.tr("加载中..."))
+            .text_color(view.theme.muted)
+            .child(view.tr("加载中..."))
             .into_any_element(),
-        Preview::Dir => div().text_sm().child(root.tr("目录")).into_any_element(),
+        Preview::Dir => div().text_sm().child(view.tr("目录")).into_any_element(),
         Preview::Binary { size } => div()
             .text_sm()
             .child(SharedString::from(format!(
                 "{} · {}",
-                root.tr("二进制文件"),
+                view.tr("二进制文件"),
                 human_size(*size)
             )))
             .into_any_element(),

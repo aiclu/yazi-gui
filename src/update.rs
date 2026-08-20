@@ -9,9 +9,8 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::UnboundedSender;
-use url::Url;
 
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/aiclu/yazi-gui/releases/latest";
@@ -41,6 +40,151 @@ pub enum DownloadResult {
     Cancelled,
 }
 
+#[derive(Clone)]
+pub(crate) enum UpdatePhase {
+    Idle,
+    Checking,
+    UpToDate {
+        version: String,
+    },
+    Available(ReleaseInfo),
+    Downloading {
+        progress: DownloadProgress,
+    },
+    Ready {
+        release: ReleaseInfo,
+        archive: PathBuf,
+        progress: DownloadProgress,
+    },
+    Restarting,
+    Failed(String),
+}
+
+pub(crate) struct UpdateState {
+    pub(crate) phase: UpdatePhase,
+    request_id: u64,
+    cancel: Option<Arc<AtomicBool>>,
+}
+
+impl Default for UpdateState {
+    fn default() -> Self {
+        Self {
+            phase: UpdatePhase::Idle,
+            request_id: 0,
+            cancel: None,
+        }
+    }
+}
+
+impl UpdateState {
+    pub(crate) fn is_busy(&self) -> bool {
+        matches!(
+            self.phase,
+            UpdatePhase::Checking | UpdatePhase::Downloading { .. } | UpdatePhase::Restarting
+        )
+    }
+
+    pub(crate) fn begin_check(&mut self) -> u64 {
+        self.request_id = self.request_id.wrapping_add(1);
+        self.cancel = None;
+        self.phase = UpdatePhase::Checking;
+        self.request_id
+    }
+
+    pub(crate) fn begin_download(&mut self, cancel: Arc<AtomicBool>, total: u64) -> u64 {
+        self.request_id = self.request_id.wrapping_add(1);
+        self.cancel = Some(cancel);
+        self.phase = UpdatePhase::Downloading {
+            progress: DownloadProgress {
+                downloaded: 0,
+                total,
+                bytes_per_second: 0,
+            },
+        };
+        self.request_id
+    }
+
+    pub(crate) fn accepts(&self, request_id: u64) -> bool {
+        self.request_id == request_id
+    }
+
+    pub(crate) fn update_download_progress(
+        &mut self,
+        request_id: u64,
+        progress: DownloadProgress,
+    ) -> bool {
+        if !self.accepts(request_id) {
+            return false;
+        }
+        if let UpdatePhase::Downloading { progress: current } = &mut self.phase {
+            *current = progress;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn finish_check(
+        &mut self,
+        request_id: u64,
+        result: Result<ReleaseInfo>,
+    ) -> Option<UpdatePhase> {
+        if !self.accepts(request_id) {
+            return None;
+        }
+        let phase = match result {
+            Ok(release) if is_newer_than_current(&release) => UpdatePhase::Available(release),
+            Ok(release) => UpdatePhase::UpToDate {
+                version: release.tag_name,
+            },
+            Err(error) => UpdatePhase::Failed(error.to_string()),
+        };
+        self.phase = phase.clone();
+        Some(phase)
+    }
+
+    pub(crate) fn finish_download(
+        &mut self,
+        request_id: u64,
+        release: ReleaseInfo,
+        result: Result<DownloadResult>,
+    ) -> Option<UpdatePhase> {
+        if !self.accepts(request_id) {
+            return None;
+        }
+        let progress = match &self.phase {
+            UpdatePhase::Downloading { progress } => *progress,
+            _ => DownloadProgress::default(),
+        };
+        let phase = match result {
+            Ok(DownloadResult::Completed(archive)) => UpdatePhase::Ready {
+                release,
+                archive,
+                progress,
+            },
+            Ok(DownloadResult::Cancelled) => UpdatePhase::Available(release),
+            Err(error) => UpdatePhase::Failed(error.to_string()),
+        };
+        self.cancel = None;
+        self.phase = phase.clone();
+        Some(phase)
+    }
+
+    pub(crate) fn cancel_download(&self) {
+        if let Some(cancel) = &self.cancel {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn begin_restart(&mut self) -> bool {
+        if !matches!(self.phase, UpdatePhase::Ready { .. }) {
+            return false;
+        }
+        self.phase = UpdatePhase::Restarting;
+        true
+    }
+}
+
 #[derive(Deserialize)]
 struct GithubRelease {
     tag_name: String,
@@ -58,7 +202,8 @@ struct GithubAsset {
 }
 
 pub fn check_latest_release() -> Result<ReleaseInfo> {
-    let body = fetch_bytes(LATEST_RELEASE_URL).context("request latest GitHub release")?;
+    let body = crate::platform::http::fetch_bytes(LATEST_RELEASE_URL)
+        .context("request latest GitHub release")?;
     let release: GithubRelease =
         serde_json::from_slice(&body).context("parse latest GitHub release")?;
     if release.draft || release.prerelease {
@@ -105,13 +250,14 @@ pub fn download_release(
     cancel: Arc<AtomicBool>,
     progress_tx: &UnboundedSender<DownloadProgress>,
 ) -> Result<DownloadResult> {
-    let checksum_body = fetch_bytes(&release.checksum_url).context("download release checksum")?;
+    let checksum_body = crate::platform::http::fetch_bytes(&release.checksum_url)
+        .context("download release checksum")?;
     let expected_hash = checksum_for_asset(&checksum_body, &release.asset_name)?;
     let destination = update_temp_path(&release.asset_name);
     let partial = destination.with_extension("zip.part");
     let _ = fs::remove_file(&partial);
 
-    let result = download_file(
+    let result = crate::platform::http::download_file(
         &release.asset_url,
         &partial,
         release.asset_size,
@@ -268,301 +414,6 @@ fn sha256_file(path: &Path) -> Result<String> {
 }
 
 #[cfg(windows)]
-fn download_file(
-    url: &str,
-    path: &Path,
-    asset_total: u64,
-    cancel: Arc<AtomicBool>,
-    progress_tx: &UnboundedSender<DownloadProgress>,
-) -> Result<DownloadResult> {
-    let response = HttpResponse::open(url)?;
-    let total = response.content_length.unwrap_or(asset_total);
-    let mut file = File::create(path).with_context(|| format!("create {}", path.display()))?;
-    let mut downloaded = 0u64;
-    let started = Instant::now();
-    let mut last_report = Instant::now();
-    let mut buffer = vec![0u8; 1024 * 1024];
-
-    loop {
-        if cancel.load(Ordering::Relaxed) {
-            let _ = fs::remove_file(path);
-            return Ok(DownloadResult::Cancelled);
-        }
-        let mut available = 0u32;
-        if unsafe {
-            windows_sys::Win32::Networking::WinHttp::WinHttpQueryDataAvailable(
-                response.request.0,
-                &mut available,
-            )
-        } == 0
-        {
-            return Err(win_error("WinHttpQueryDataAvailable"));
-        }
-        if available == 0 {
-            break;
-        }
-        let requested = available.min(buffer.len() as u32);
-        let mut read = 0u32;
-        if unsafe {
-            windows_sys::Win32::Networking::WinHttp::WinHttpReadData(
-                response.request.0,
-                buffer.as_mut_ptr().cast(),
-                requested,
-                &mut read,
-            )
-        } == 0
-        {
-            return Err(win_error("WinHttpReadData"));
-        }
-        if read == 0 {
-            break;
-        }
-        file.write_all(&buffer[..read as usize])?;
-        downloaded = downloaded.saturating_add(read as u64);
-        if last_report.elapsed() >= Duration::from_millis(100) || downloaded == total {
-            let elapsed = started.elapsed().as_secs_f64().max(0.001);
-            let _ = progress_tx.send(DownloadProgress {
-                downloaded,
-                total,
-                bytes_per_second: (downloaded as f64 / elapsed) as u64,
-            });
-            last_report = Instant::now();
-        }
-    }
-    file.flush()?;
-    let elapsed = started.elapsed().as_secs_f64().max(0.001);
-    let _ = progress_tx.send(DownloadProgress {
-        downloaded,
-        total,
-        bytes_per_second: (downloaded as f64 / elapsed) as u64,
-    });
-    Ok(DownloadResult::Completed(path.to_path_buf()))
-}
-
-#[cfg(not(windows))]
-fn download_file(
-    _url: &str,
-    _path: &Path,
-    _asset_total: u64,
-    _cancel: Arc<AtomicBool>,
-    _progress_tx: &UnboundedSender<DownloadProgress>,
-) -> Result<DownloadResult> {
-    Err(anyhow!("update download is only supported on Windows"))
-}
-
-#[cfg(windows)]
-fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
-    let response = HttpResponse::open(url)?;
-    let mut body = Vec::new();
-    let mut buffer = vec![0u8; 64 * 1024];
-    loop {
-        let mut available = 0u32;
-        if unsafe {
-            windows_sys::Win32::Networking::WinHttp::WinHttpQueryDataAvailable(
-                response.request.0,
-                &mut available,
-            )
-        } == 0
-        {
-            return Err(win_error("WinHttpQueryDataAvailable"));
-        }
-        if available == 0 {
-            break;
-        }
-        let requested = available.min(buffer.len() as u32);
-        let mut read = 0u32;
-        if unsafe {
-            windows_sys::Win32::Networking::WinHttp::WinHttpReadData(
-                response.request.0,
-                buffer.as_mut_ptr().cast(),
-                requested,
-                &mut read,
-            )
-        } == 0
-        {
-            return Err(win_error("WinHttpReadData"));
-        }
-        if read == 0 {
-            break;
-        }
-        body.extend_from_slice(&buffer[..read as usize]);
-        if body.len() > 16 * 1024 * 1024 {
-            return Err(anyhow!("update response is too large"));
-        }
-    }
-    Ok(body)
-}
-
-#[cfg(not(windows))]
-fn fetch_bytes(_url: &str) -> Result<Vec<u8>> {
-    Err(anyhow!("update check is only supported on Windows"))
-}
-
-#[cfg(windows)]
-struct HttpResponse {
-    _session: HttpHandle,
-    _connection: HttpHandle,
-    request: HttpHandle,
-    content_length: Option<u64>,
-}
-
-#[cfg(windows)]
-struct HttpHandle(*mut std::ffi::c_void);
-
-#[cfg(windows)]
-impl Drop for HttpHandle {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe {
-                let _ = windows_sys::Win32::Networking::WinHttp::WinHttpCloseHandle(self.0);
-            }
-        }
-    }
-}
-
-#[cfg(windows)]
-impl HttpResponse {
-    fn open(url: &str) -> Result<Self> {
-        use std::ptr::{null, null_mut};
-        use windows_sys::Win32::Networking::WinHttp::{
-            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE, WINHTTP_QUERY_CONTENT_LENGTH,
-            WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE, WinHttpConnect, WinHttpOpen,
-            WinHttpOpenRequest, WinHttpQueryHeaders, WinHttpReceiveResponse, WinHttpSendRequest,
-            WinHttpSetTimeouts,
-        };
-
-        let parsed = Url::parse(url).with_context(|| format!("parse update URL {url}"))?;
-        if parsed.scheme() != "https" || !parsed.username().is_empty() {
-            return Err(anyhow!("update URL must use HTTPS without credentials"));
-        }
-        let host = parsed
-            .host_str()
-            .ok_or_else(|| anyhow!("update URL has no host"))?;
-        let port = parsed.port_or_known_default().unwrap_or(443);
-        let mut object = parsed.path().to_string();
-        if object.is_empty() {
-            object.push('/');
-        }
-        if let Some(query) = parsed.query() {
-            object.push('?');
-            object.push_str(query);
-        }
-
-        let agent = wide(&format!("yazi-gui/{CURRENT_VERSION}"));
-        let host = wide(host);
-        let object = wide(&object);
-        let headers = wide(
-            "User-Agent: yazi-gui\r\nAccept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\n",
-        );
-        let session = unsafe {
-            WinHttpOpen(
-                agent.as_ptr(),
-                WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-                null(),
-                null(),
-                0,
-            )
-        };
-        let session = non_null_handle(session, "WinHttpOpen")?;
-        unsafe {
-            if WinHttpSetTimeouts(session.0, 10_000, 10_000, 10_000, 30_000) == 0 {
-                return Err(win_error("WinHttpSetTimeouts"));
-            }
-        }
-        let connection = unsafe { WinHttpConnect(session.0, host.as_ptr(), port, 0) };
-        let connection = non_null_handle(connection, "WinHttpConnect")?;
-        let request = unsafe {
-            WinHttpOpenRequest(
-                connection.0,
-                wide("GET").as_ptr(),
-                object.as_ptr(),
-                null(),
-                null(),
-                null(),
-                WINHTTP_FLAG_SECURE,
-            )
-        };
-        let request = non_null_handle(request, "WinHttpOpenRequest")?;
-        unsafe {
-            if WinHttpSendRequest(request.0, headers.as_ptr(), u32::MAX, null(), 0, 0, 0) == 0 {
-                return Err(win_error("WinHttpSendRequest"));
-            }
-            if WinHttpReceiveResponse(request.0, null_mut()) == 0 {
-                return Err(win_error("WinHttpReceiveResponse"));
-            }
-        }
-
-        let mut status = 0u32;
-        let mut status_len = std::mem::size_of::<u32>() as u32;
-        unsafe {
-            if WinHttpQueryHeaders(
-                request.0,
-                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                null(),
-                (&mut status as *mut u32).cast(),
-                &mut status_len,
-                null_mut(),
-            ) == 0
-            {
-                return Err(win_error("WinHttpQueryHeaders status"));
-            }
-        }
-        if !(200..300).contains(&status) {
-            return Err(anyhow!("update server returned HTTP {status}"));
-        }
-
-        let mut length_buffer = [0u16; 64];
-        let mut length_bytes = (length_buffer.len() * std::mem::size_of::<u16>()) as u32;
-        let content_length = unsafe {
-            if WinHttpQueryHeaders(
-                request.0,
-                WINHTTP_QUERY_CONTENT_LENGTH,
-                null(),
-                length_buffer.as_mut_ptr().cast(),
-                &mut length_bytes,
-                null_mut(),
-            ) != 0
-            {
-                String::from_utf16_lossy(&length_buffer[..(length_bytes as usize / 2)])
-                    .trim_matches('\0')
-                    .trim()
-                    .parse()
-                    .ok()
-            } else {
-                None
-            }
-        };
-
-        Ok(Self {
-            _session: session,
-            _connection: connection,
-            request,
-            content_length,
-        })
-    }
-}
-
-#[cfg(windows)]
-fn non_null_handle(handle: *mut std::ffi::c_void, operation: &str) -> Result<HttpHandle> {
-    if handle.is_null() {
-        Err(win_error(operation))
-    } else {
-        Ok(HttpHandle(handle))
-    }
-}
-
-#[cfg(windows)]
-fn win_error(operation: &str) -> anyhow::Error {
-    let code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
-    anyhow!("{operation} failed with Windows error {code}")
-}
-
-#[cfg(windows)]
-fn wide(value: &str) -> Vec<u16> {
-    value.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-#[cfg(windows)]
 fn apply_update(
     archive: &Path,
     executable: &Path,
@@ -570,18 +421,7 @@ fn apply_update(
     updater_path: &Path,
 ) -> Result<()> {
     use std::process::Command;
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{
-        INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
-    };
-
-    unsafe {
-        let parent = OpenProcess(PROCESS_SYNCHRONIZE, 0, parent_pid);
-        if !parent.is_null() {
-            let _ = WaitForSingleObject(parent, INFINITE);
-            let _ = CloseHandle(parent);
-        }
-    }
+    crate::platform::window::wait_for_process_exit(parent_pid);
 
     let install_root = executable
         .parent()
@@ -688,10 +528,14 @@ fn extract_archive(_archive: &Path, _staging: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ReleaseInfo, checksum_for_asset, expected_asset_name, is_newer_than_current,
-        update_temp_path,
+        DownloadResult, ReleaseInfo, UpdatePhase, UpdateState, checksum_for_asset,
+        expected_asset_name, is_newer_than_current, update_temp_path,
     };
     use semver::Version;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
 
     #[test]
     fn checksum_manifest_matches_named_asset() {
@@ -723,9 +567,11 @@ mod tests {
 
     #[test]
     fn newer_release_is_required_before_download() {
+        let current = Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
+        let newer = Version::new(current.major, current.minor, current.patch + 1);
         let release = ReleaseInfo {
-            tag_name: "v0.2.3".to_string(),
-            version: Version::new(0, 2, 3),
+            tag_name: format!("v{newer}"),
+            version: newer,
             page_url: String::new(),
             asset_name: String::new(),
             asset_url: String::new(),
@@ -745,5 +591,63 @@ mod tests {
                 .contains("package.zip")
         );
         assert_eq!(path.parent(), Some(std::env::temp_dir().as_path()));
+    }
+
+    #[test]
+    fn stale_update_requests_cannot_replace_current_phase() {
+        let mut state = UpdateState::default();
+        let first = state.begin_check();
+        let second = state.begin_check();
+        assert!(
+            state
+                .finish_check(first, Err(anyhow::anyhow!("stale")))
+                .is_none()
+        );
+        assert!(matches!(
+            state.finish_check(second, Ok(release())),
+            Some(UpdatePhase::Available(_))
+        ));
+    }
+
+    #[test]
+    fn download_lifecycle_owns_cancellation_and_completion() {
+        let mut state = UpdateState::default();
+        state.phase = UpdatePhase::Available(release());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let request = state.begin_download(cancel.clone(), 10);
+        state.update_download_progress(
+            request,
+            super::DownloadProgress {
+                downloaded: 5,
+                total: 10,
+                bytes_per_second: 1,
+            },
+        );
+        state.cancel_download();
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(matches!(
+            state.finish_download(
+                request,
+                release(),
+                Ok(DownloadResult::Completed(
+                    std::env::temp_dir().join("update.zip")
+                )),
+            ),
+            Some(UpdatePhase::Ready { .. })
+        ));
+    }
+
+    fn release() -> ReleaseInfo {
+        let current = Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
+        let version = Version::new(current.major, current.minor, current.patch + 1);
+        ReleaseInfo {
+            tag_name: format!("v{version}"),
+            version,
+            page_url: String::new(),
+            asset_name: "update.zip".to_string(),
+            asset_url: String::new(),
+            asset_size: 10,
+            checksum_url: String::new(),
+        }
     }
 }

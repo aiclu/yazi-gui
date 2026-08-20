@@ -1,20 +1,27 @@
 use super::super::*;
+use super::UiIntent;
 use super::components::{action_button, settings_line, shortcut_binding_view};
 
-pub(crate) fn render(root: &Root, cx: &mut Context<Root>) -> AnyElement {
-    let theme = root.theme;
-    let language = root.language();
-    let focus_handle = root.focus_handle.clone();
-    let theme_label = match root.settings.theme {
-        ThemeMode::Dark => root.tr("暗色"),
-        ThemeMode::Light => root.tr("浅色"),
+pub(crate) fn render(
+    view: &UiProjection,
+    cx: &mut Context<Root>,
+    titlebar: AnyElement,
+    input_bar: AnyElement,
+    status_bar: AnyElement,
+) -> AnyElement {
+    let theme = view.theme;
+    let language = view.language;
+    let focus_handle = view.focus_handle.clone();
+    let theme_label = match view.settings.theme {
+        ThemeMode::Dark => view.tr("暗色"),
+        ThemeMode::Light => view.tr("浅色"),
     };
-    let autostart_label = if root.settings.autostart {
-        root.tr("已开启")
+    let autostart_label = if view.settings.autostart {
+        view.tr("已开启")
     } else {
-        root.tr("已关闭")
+        view.tr("已关闭")
     };
-    let shortcuts = if root.shortcuts_expanded {
+    let shortcuts = if view.shortcuts_expanded {
         [
             ShortcutAction::Open,
             ShortcutAction::Search,
@@ -29,18 +36,18 @@ pub(crate) fn render(root: &Root, cx: &mut Context<Root>) -> AnyElement {
             ShortcutAction::NewDir,
         ]
         .into_iter()
-        .map(|action| shortcut_setting_row(root, cx, action))
+        .map(|action| shortcut_setting_row(view, cx, action))
         .collect::<Vec<_>>()
     } else {
         Vec::new()
     };
-    let shortcut_indicator = if root.shortcuts_expanded {
+    let shortcut_indicator = if view.shortcuts_expanded {
         "▾"
     } else {
         "▸"
     };
     let shortcuts_label =
-        SharedString::from(format!("{} {}", shortcut_indicator, root.tr("快捷键")));
+        SharedString::from(format!("{} {}", shortcut_indicator, view.tr("快捷键")));
 
     div()
         .size_full()
@@ -53,7 +60,7 @@ pub(crate) fn render(root: &Root, cx: &mut Context<Root>) -> AnyElement {
         .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
             this.on_input_key(event, window, cx);
         }))
-        .child(root.titlebar(cx))
+        .child(titlebar)
         .child(
             div()
                 .w_full()
@@ -69,24 +76,24 @@ pub(crate) fn render(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                     cx,
                     theme,
                     "settings-back",
-                    root.tr("返回文件"),
-                    |this, _window, cx| this.show_files(cx),
+                    view.tr("返回文件"),
+                    UiIntent::ShowFiles,
                 ))
                 .child(
                     div()
                         .flex()
                         .flex_col()
                         .gap_1()
-                        .child(div().text_xl().child(root.tr("设置")))
+                        .child(div().text_xl().child(view.tr("设置")))
                         .child(
                             div()
                                 .text_xs()
                                 .text_color(theme.muted)
-                                .child(root.tr("应用外观、行为和更新")),
+                                .child(view.tr("应用外观、行为和更新")),
                         ),
                 ),
         )
-        .child(root.input_bar(cx))
+        .child(input_bar)
         .child(
             div()
                 .flex_1()
@@ -103,7 +110,7 @@ pub(crate) fn render(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                         .gap_4()
                         .child(section_card(
                             theme,
-                            root.tr("外观"),
+                            view.tr("外观"),
                             div()
                                 .w_full()
                                 .flex()
@@ -112,23 +119,23 @@ pub(crate) fn render(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                                 .child(settings_line(
                                     cx,
                                     theme,
-                                    root.tr("主题"),
+                                    view.tr("主题"),
                                     theme_label,
                                     "settings-theme",
-                                    |this, _window, cx| this.toggle_theme(cx),
+                                    UiIntent::ToggleTheme,
                                 ))
                                 .child(settings_line(
                                     cx,
                                     theme,
-                                    root.tr("语言"),
-                                    root.tr(language.label()),
+                                    view.tr("语言"),
+                                    view.tr(language.label()),
                                     "settings-language",
-                                    |this, _window, cx| this.cycle_language(cx),
+                                    UiIntent::CycleLanguage,
                                 )),
                         ))
                         .child(section_card(
                             theme,
-                            root.tr("行为"),
+                            view.tr("行为"),
                             div()
                                 .w_full()
                                 .flex()
@@ -137,19 +144,17 @@ pub(crate) fn render(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                                 .child(settings_line(
                                     cx,
                                     theme,
-                                    root.tr("自启动"),
+                                    view.tr("自启动"),
                                     autostart_label,
                                     "settings-autostart",
-                                    |this, _window, cx| {
-                                        this.set_autostart(!this.settings.autostart, cx)
-                                    },
+                                    UiIntent::SetAutostart(!view.settings.autostart),
                                 ))
                                 .child(
                                     div()
                                         .py_1()
                                         .text_xs()
                                         .text_color(theme.muted)
-                                        .child(root.tr("自启动默认关闭")),
+                                        .child(view.tr("自启动默认关闭")),
                                 ),
                         ))
                         .child(section_card_with_title(
@@ -160,15 +165,15 @@ pub(crate) fn render(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                                 .text_lg()
                                 .cursor_pointer()
                                 .id("settings-shortcuts-toggle")
-                                .on_click(cx.listener(|this, _event, _window, cx| {
-                                    this.toggle_shortcuts(cx);
+                                .on_click(cx.listener(|this, _event, window, cx| {
+                                    this.dispatch_ui_intent(UiIntent::ToggleShortcuts, window, cx);
                                 }))
                                 .child(shortcuts_label),
                             div().w_full().flex().flex_col().gap_1().children(shortcuts),
                         ))
                         .child(section_card(
                             theme,
-                            root.tr("关于"),
+                            view.tr("关于"),
                             div()
                                 .w_full()
                                 .flex()
@@ -176,24 +181,20 @@ pub(crate) fn render(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                                 .gap_2()
                                 .child(div().text_sm().child(format!(
                                     "{}: {}",
-                                    root.tr("当前版本"),
+                                    view.tr("当前版本"),
                                     env!("CARGO_PKG_VERSION")
                                 )))
                                 .child(
                                     div()
                                         .text_xs()
                                         .text_color(theme.muted)
-                                        .child(root.tr("关闭窗口时隐藏到托盘")),
+                                        .child(view.tr("关闭窗口时隐藏到托盘")),
                                 )
-                                .child(update_panel(root, cx)),
+                                .child(update_panel(view, cx)),
                         )),
                 ),
         )
-        .child(root.status_bar(
-            cx,
-            theme,
-            SharedString::from(root.status.clone().unwrap_or_default()),
-        ))
+        .child(status_bar)
         .into_any_element()
 }
 
@@ -225,8 +226,8 @@ fn section_card_with_title(
         .into_any_element()
 }
 
-fn update_panel(root: &Root, cx: &mut Context<Root>) -> AnyElement {
-    let theme = root.theme;
+fn update_panel(view: &UiProjection, cx: &mut Context<Root>) -> AnyElement {
+    let theme = view.theme;
     let mut panel = div()
         .w_full()
         .p_3()
@@ -237,16 +238,16 @@ fn update_panel(root: &Root, cx: &mut Context<Root>) -> AnyElement {
         .flex()
         .flex_col()
         .gap_2()
-        .child(div().text_sm().child(root.tr("应用更新")));
+        .child(div().text_sm().child(view.tr("应用更新")));
 
-    match &root.update.phase {
+    match &view.update.phase {
         UpdatePhase::Idle => {
             panel = panel.child(action_button(
                 cx,
                 theme,
                 "settings-update-check",
-                root.tr("检查更新"),
-                |this, _window, cx| this.check_for_updates(cx),
+                view.tr("检查更新"),
+                UiIntent::CheckUpdates,
             ));
         }
         UpdatePhase::Checking => {
@@ -254,7 +255,7 @@ fn update_panel(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                 div()
                     .text_xs()
                     .text_color(theme.muted)
-                    .child(root.tr("正在检查更新...")),
+                    .child(view.tr("正在检查更新...")),
             );
         }
         UpdatePhase::UpToDate { version } => {
@@ -262,21 +263,21 @@ fn update_panel(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                 .child(
                     div()
                         .text_xs()
-                        .child(format!("{}: {}", root.tr("已是最新版本"), version)),
+                        .child(format!("{}: {}", view.tr("已是最新版本"), version)),
                 )
                 .child(action_button(
                     cx,
                     theme,
                     "settings-update-check-again",
-                    root.tr("再次检查"),
-                    |this, _window, cx| this.check_for_updates(cx),
+                    view.tr("再次检查"),
+                    UiIntent::CheckUpdates,
                 ));
         }
         UpdatePhase::Available(release) => {
             panel = panel
                 .child(div().text_xs().child(format!(
                     "{}: {}",
-                    root.tr("发现新版本"),
+                    view.tr("发现新版本"),
                     release.tag_name
                 )))
                 .child(
@@ -287,18 +288,15 @@ fn update_panel(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                             cx,
                             theme,
                             "settings-update-download",
-                            root.tr("下载更新"),
-                            |this, _window, cx| this.download_update(cx),
+                            view.tr("下载更新"),
+                            UiIntent::DownloadUpdate,
                         ))
                         .child(action_button(
                             cx,
                             theme,
                             "settings-update-release",
-                            root.tr("打开发布页"),
-                            {
-                                let url = release.page_url.clone();
-                                move |this, _window, cx| this.open_external_url(url.clone(), cx)
-                            },
+                            view.tr("打开发布页"),
+                            UiIntent::OpenExternalUrl(release.page_url.clone()),
                         )),
                 );
         }
@@ -309,8 +307,8 @@ fn update_panel(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                     cx,
                     theme,
                     "settings-update-cancel",
-                    root.tr("取消下载"),
-                    |this, _window, cx| this.cancel_update_download(cx),
+                    view.tr("取消下载"),
+                    UiIntent::CancelUpdateDownload,
                 ));
         }
         UpdatePhase::Ready {
@@ -320,15 +318,15 @@ fn update_panel(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                 .child(download_progress(theme, *progress))
                 .child(div().text_xs().child(format!(
                     "{}: {}",
-                    root.tr("下载完成"),
+                    view.tr("下载完成"),
                     release.tag_name
                 )))
                 .child(action_button(
                     cx,
                     theme,
                     "settings-update-restart",
-                    root.tr("重启完成更新"),
-                    |this, _window, cx| this.restart_update(cx),
+                    view.tr("重启完成更新"),
+                    UiIntent::RestartUpdate,
                 ));
         }
         UpdatePhase::Restarting => {
@@ -336,7 +334,7 @@ fn update_panel(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                 div()
                     .text_xs()
                     .text_color(theme.muted)
-                    .child(root.tr("正在重启完成更新...")),
+                    .child(view.tr("正在重启完成更新...")),
             );
         }
         UpdatePhase::Failed(error) => {
@@ -351,8 +349,8 @@ fn update_panel(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                     cx,
                     theme,
                     "settings-update-retry",
-                    root.tr("重新检查"),
-                    |this, _window, cx| this.check_for_updates(cx),
+                    view.tr("重新检查"),
+                    UiIntent::CheckUpdates,
                 ));
         }
     }
@@ -394,13 +392,17 @@ fn download_progress(theme: Theme, progress: update::DownloadProgress) -> AnyEle
         .into_any_element()
 }
 
-fn shortcut_setting_row(root: &Root, cx: &mut Context<Root>, action: ShortcutAction) -> AnyElement {
-    let theme = root.theme;
-    let label = SharedString::from(root.tr(action.label()));
-    let value = action.shortcut(&root.settings.shortcuts);
+fn shortcut_setting_row(
+    view: &UiProjection,
+    cx: &mut Context<Root>,
+    action: ShortcutAction,
+) -> AnyElement {
+    let theme = view.theme;
+    let label = SharedString::from(view.tr(action.label()));
+    let value = action.shortcut(&view.settings.shortcuts);
     let recording = matches!(
-        root.pending,
-        Some(PendingOp::EditShortcut(editing)) if editing == action
+        view.pending,
+        Some(PendingOp::EditShortcut(editing)) if *editing == action
     );
     div()
         .w_full()
@@ -422,13 +424,13 @@ fn shortcut_setting_row(root: &Root, cx: &mut Context<Root>, action: ShortcutAct
                 .id(action.id())
                 .hover(|style| style.bg(theme.hover))
                 .on_click(cx.listener(move |this, _event, window, cx| {
-                    this.start_shortcut_edit(action, window, cx);
+                    this.dispatch_ui_intent(UiIntent::StartShortcutEdit(action.id()), window, cx);
                 }))
                 .child(shortcut_binding_view(
                     theme,
                     value,
                     recording,
-                    root.language(),
+                    view.language,
                 )),
         )
         .into_any_element()

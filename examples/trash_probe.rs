@@ -9,7 +9,6 @@ unsafe extern "system" {
 }
 
 const COINIT_MULTITHREADED: u32 = 0x0;
-const COINIT_APARTMENTTHREADED: u32 = 0x2;
 
 fn main() {
     let tmp = "D:\\Projects\\gui_for_yazi\\_probe_trash_test.txt";
@@ -22,7 +21,11 @@ fn main() {
         eprintln!(
             "[trash-probe] CoInitializeEx(MTA) -> hr={:#010x} ({} = RPC_E_CHANGED_MODE)",
             hr as u32,
-            if hr as u32 == 0x8001_0106 { "YES" } else { "no" }
+            if hr as u32 == 0x8001_0106 {
+                "YES"
+            } else {
+                "no"
+            }
         );
 
         // 关键：trash 内部会再次 CoInitializeEx，用 coinit_multithreaded 时 MTA 上返回 S_FALSE 不 panic

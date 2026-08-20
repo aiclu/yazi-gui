@@ -22,7 +22,10 @@ fn main() {
             "--local-events",
             "cd,hover,gui-files",
         ])
-        .env("YAZI_CONFIG_HOME", "D:\\Projects\\gui_for_yazi\\assets\\yazi")
+        .env(
+            "YAZI_CONFIG_HOME",
+            "D:\\Projects\\gui_for_yazi\\assets\\yazi",
+        )
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

@@ -3,23 +3,23 @@ use anyhow::Result;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 #[derive(Debug, Clone, Copy)]
-pub enum TrayCommand {
+pub(crate) enum TrayCommand {
     Show,
     Settings,
     Exit,
 }
 
 #[cfg(windows)]
-pub struct TrayController {
+pub(crate) struct TrayController {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     language: std::sync::Arc<std::sync::atomic::AtomicU8>,
 }
 
 #[cfg(not(windows))]
-pub struct TrayController;
+pub(crate) struct TrayController;
 
 impl TrayController {
-    pub fn new(language: Language) -> Result<(Self, UnboundedReceiver<TrayCommand>)> {
+    pub(crate) fn new(language: Language) -> Result<(Self, UnboundedReceiver<TrayCommand>)> {
         #[cfg(windows)]
         {
             let (tx, rx) = unbounded_channel();
@@ -50,7 +50,7 @@ impl TrayController {
         }
     }
 
-    pub fn set_language(&self, language: Language) {
+    pub(crate) fn set_language(&self, language: Language) {
         #[cfg(windows)]
         self.language.store(
             language_code(language),

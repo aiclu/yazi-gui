@@ -4,14 +4,6 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use time::{OffsetDateTime, UtcOffset};
-use tokio::sync::mpsc::UnboundedSender;
-
-#[cfg(windows)]
-use std::os::windows::ffi::OsStrExt;
-#[cfg(windows)]
-use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
-#[cfg(windows)]
-use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOTE;
 
 #[derive(Clone)]
 pub struct FolderEntry {
@@ -47,6 +39,32 @@ pub enum TransferUpdate {
         current: String,
     },
     Finished(TransferOutcome),
+}
+
+pub struct TransferControl {
+    cancelled: AtomicBool,
+}
+
+impl TransferControl {
+    pub fn new() -> Self {
+        Self {
+            cancelled: AtomicBool::new(false),
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, AtomicOrdering::Relaxed);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(AtomicOrdering::Relaxed)
+    }
+}
+
+impl Default for TransferControl {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -94,15 +112,7 @@ pub fn scan_folder_children(root: &Path) -> io::Result<Vec<FolderEntry>> {
     for entry in fs::read_dir(root)? {
         let entry = entry?;
         let path = entry.path();
-        let metadata = fs::symlink_metadata(&path)?;
-        let is_link = is_link_metadata(&metadata);
-        let is_dir = if is_link {
-            fs::metadata(&path)
-                .map(|target| target.is_dir())
-                .unwrap_or(false)
-        } else {
-            metadata.is_dir()
-        };
+        let (_, is_link, is_dir) = classify_entry(&path)?;
         if !is_dir {
             continue;
         }
@@ -119,6 +129,19 @@ pub fn scan_folder_children(root: &Path) -> io::Result<Vec<FolderEntry>> {
             .then_with(|| left.name.cmp(&right.name))
     });
     Ok(children)
+}
+
+fn classify_entry(path: &Path) -> io::Result<(fs::Metadata, bool, bool)> {
+    let metadata = fs::symlink_metadata(path)?;
+    let is_link = is_link_metadata(&metadata);
+    let is_dir = if is_link {
+        fs::metadata(path)
+            .map(|target| target.is_dir())
+            .unwrap_or(false)
+    } else {
+        metadata.is_dir()
+    };
+    Ok((metadata, is_link, is_dir))
 }
 
 fn is_link_metadata(metadata: &fs::Metadata) -> bool {
@@ -143,15 +166,7 @@ pub fn search_directory(root: &Path, query: &str) -> io::Result<Vec<FileEntry>> 
         for entry in fs::read_dir(&directory)? {
             let entry = entry?;
             let path = entry.path();
-            let metadata = fs::symlink_metadata(&path)?;
-            let is_symlink = is_link_metadata(&metadata);
-            let is_dir = if is_symlink {
-                fs::metadata(&path)
-                    .map(|target| target.is_dir())
-                    .unwrap_or(false)
-            } else {
-                metadata.is_dir()
-            };
+            let (metadata, is_symlink, is_dir) = classify_entry(&path)?;
             let relative = path
                 .strip_prefix(root)
                 .unwrap_or(&path)
@@ -174,7 +189,6 @@ pub fn search_directory(root: &Path, query: &str) -> io::Result<Vec<FileEntry>> 
                 results.push(FileEntry {
                     name: relative,
                     is_dir,
-                    is_hidden: false,
                     size: if is_dir { 0 } else { metadata.len() },
                     mtime,
                 });
@@ -217,68 +231,10 @@ pub fn is_drive_root(cwd: &str) -> bool {
     }
 }
 
-/// 扫描当前可见的磁盘盘符（A-Z）。
-pub fn scan_drives() -> Vec<String> {
-    (b'A'..=b'Z')
-        .map(|c| format!("{}:\\", c as char))
-        .filter(|drive| Path::new(drive).exists())
-        .collect()
-}
-
-pub fn is_unc_path(path: &str) -> bool {
-    let extended_prefix = "\\\\?\\";
-    if let Some(rest) = path.strip_prefix(extended_prefix) {
-        return rest
-            .get(..4)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("UNC\\"));
-    }
-    path.starts_with("\\\\")
-}
-
-pub fn is_network_path(path: &Path) -> io::Result<bool> {
-    let text = path.to_string_lossy();
-    if is_unc_path(&text) {
-        return Ok(true);
-    }
-
-    #[cfg(windows)]
-    {
-        let drive_path = text.strip_prefix("\\\\?\\").unwrap_or(&text);
-        let mut chars = drive_path.chars();
-        let Some(drive) = chars.next() else {
-            return Ok(false);
-        };
-        if chars.next() != Some(':') || !drive.is_ascii_alphabetic() {
-            return Ok(false);
-        }
-
-        let root = format!("{}:\\", drive);
-        let wide: Vec<u16> = std::ffi::OsStr::new(&root)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        let drive_type = unsafe { GetDriveTypeW(wide.as_ptr()) };
-        return match drive_type {
-            DRIVE_REMOTE => Ok(true),
-            0 | 1 => Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("无法识别磁盘 {}", drive),
-            )),
-            _ => Ok(false),
-        };
-    }
-
-    #[cfg(not(windows))]
-    {
-        let _ = path;
-        Ok(false)
-    }
-}
-
 pub fn network_path_count(paths: &[String]) -> Result<usize, String> {
     let mut count = 0usize;
     for path in paths {
-        match is_network_path(Path::new(path)) {
+        match crate::platform::filesystem::is_network_path(Path::new(path)) {
             Ok(true) => count += 1,
             Ok(false) => {}
             Err(error) => {
@@ -303,7 +259,7 @@ pub fn permanent_delete(path: &Path) -> io::Result<()> {
 }
 
 pub fn delete_path_with_policy(path: &Path) -> Result<DeleteMode, String> {
-    if is_network_path(path).map_err(|error| error.to_string())? {
+    if crate::platform::filesystem::is_network_path(path).map_err(|error| error.to_string())? {
         permanent_delete(path).map_err(|error| error.to_string())?;
         Ok(DeleteMode::Permanent)
     } else {
@@ -348,7 +304,7 @@ pub fn delete_status(summary: &DeleteSummary) -> String {
     status
 }
 
-fn operation_status(label: &str, success: usize, failed: usize) -> String {
+pub(crate) fn operation_status(label: &str, success: usize, failed: usize) -> String {
     match (success, failed) {
         (0, 0) => format!("{}未执行", label),
         (_, 0) => format!("{}完成 {} 项", label, success),
@@ -368,14 +324,17 @@ impl From<io::Error> for CopyError {
     }
 }
 
-pub fn copy_paths_with_progress(
+pub fn copy_paths_with_progress<F>(
     paths: &[String],
     dest: &str,
-    cancel: &AtomicBool,
-    tx: &UnboundedSender<TransferUpdate>,
-) -> TransferOutcome {
+    control: &TransferControl,
+    mut emit: F,
+) -> TransferOutcome
+where
+    F: FnMut(TransferUpdate),
+{
     let total_bytes = match paths.iter().try_fold(0u64, |total, path| {
-        copy_entry_size(Path::new(path), cancel).map(|size| total.saturating_add(size))
+        copy_entry_size(Path::new(path), control).map(|size| total.saturating_add(size))
     }) {
         Ok(total) => total,
         Err(CopyError::Cancelled) => return TransferOutcome::Cancelled { success: 0 },
@@ -387,7 +346,7 @@ pub fn copy_paths_with_progress(
         }
     };
 
-    let _ = tx.send(TransferUpdate::Progress {
+    emit(TransferUpdate::Progress {
         total_bytes,
         completed_bytes: 0,
         completed_items: 0,
@@ -397,7 +356,7 @@ pub fn copy_paths_with_progress(
     let mut completed_bytes = 0u64;
     let mut completed_items = 0usize;
     for source in paths {
-        if cancel.load(AtomicOrdering::Relaxed) {
+        if control.is_cancelled() {
             return TransferOutcome::Cancelled {
                 success: completed_items,
             };
@@ -410,8 +369,8 @@ pub fn copy_paths_with_progress(
             source_path,
             &destination,
             &name,
-            cancel,
-            tx,
+            control,
+            &mut emit,
             total_bytes,
             completed_items,
             &mut completed_bytes,
@@ -419,7 +378,7 @@ pub fn copy_paths_with_progress(
         match result {
             Ok(()) => {
                 completed_items += 1;
-                let _ = tx.send(TransferUpdate::Progress {
+                emit(TransferUpdate::Progress {
                     total_bytes,
                     completed_bytes,
                     completed_items,
@@ -445,8 +404,8 @@ pub fn copy_paths_with_progress(
     }
 }
 
-fn copy_entry_size(path: &Path, cancel: &AtomicBool) -> Result<u64, CopyError> {
-    if cancel.load(AtomicOrdering::Relaxed) {
+fn copy_entry_size(path: &Path, control: &TransferControl) -> Result<u64, CopyError> {
+    if control.is_cancelled() {
         return Err(CopyError::Cancelled);
     }
     let metadata = fs::metadata(path)?;
@@ -455,22 +414,25 @@ fn copy_entry_size(path: &Path, cancel: &AtomicBool) -> Result<u64, CopyError> {
     }
     let mut total = 0u64;
     for entry in fs::read_dir(path)? {
-        total = total.saturating_add(copy_entry_size(&entry?.path(), cancel)?);
+        total = total.saturating_add(copy_entry_size(&entry?.path(), control)?);
     }
     Ok(total)
 }
 
-fn copy_entry_with_progress(
+fn copy_entry_with_progress<F>(
     source: &Path,
     destination: &Path,
     current: &str,
-    cancel: &AtomicBool,
-    tx: &UnboundedSender<TransferUpdate>,
+    control: &TransferControl,
+    emit: &mut F,
     total_bytes: u64,
     completed_items: usize,
     completed_bytes: &mut u64,
-) -> Result<(), CopyError> {
-    if cancel.load(AtomicOrdering::Relaxed) {
+) -> Result<(), CopyError>
+where
+    F: FnMut(TransferUpdate),
+{
+    if control.is_cancelled() {
         return Err(CopyError::Cancelled);
     }
     if same_path(source, destination) {
@@ -485,8 +447,8 @@ fn copy_entry_with_progress(
                 &entry.path(),
                 &child_destination,
                 current,
-                cancel,
-                tx,
+                control,
+                emit,
                 total_bytes,
                 completed_items,
                 completed_bytes,
@@ -498,8 +460,8 @@ fn copy_entry_with_progress(
             source,
             destination,
             current,
-            cancel,
-            tx,
+            control,
+            emit,
             total_bytes,
             completed_items,
             completed_bytes,
@@ -507,16 +469,19 @@ fn copy_entry_with_progress(
     }
 }
 
-fn copy_file_with_progress(
+fn copy_file_with_progress<F>(
     source: &Path,
     destination: &Path,
     current: &str,
-    cancel: &AtomicBool,
-    tx: &UnboundedSender<TransferUpdate>,
+    control: &TransferControl,
+    emit: &mut F,
     total_bytes: u64,
     completed_items: usize,
     completed_bytes: &mut u64,
-) -> Result<(), CopyError> {
+) -> Result<(), CopyError>
+where
+    F: FnMut(TransferUpdate),
+{
     if same_path(source, destination) {
         return Err(CopyError::Io("源文件和目标文件相同".to_string()));
     }
@@ -534,7 +499,7 @@ fn copy_file_with_progress(
         let mut buffer = vec![0u8; 1024 * 1024];
 
         loop {
-            if cancel.load(AtomicOrdering::Relaxed) {
+            if control.is_cancelled() {
                 return Err(CopyError::Cancelled);
             }
             let read = input.read(&mut buffer)?;
@@ -543,7 +508,7 @@ fn copy_file_with_progress(
             }
             output.write_all(&buffer[..read])?;
             *completed_bytes = completed_bytes.saturating_add(read as u64);
-            let _ = tx.send(TransferUpdate::Progress {
+            emit(TransferUpdate::Progress {
                 total_bytes,
                 completed_bytes: *completed_bytes,
                 completed_items,
@@ -552,7 +517,7 @@ fn copy_file_with_progress(
         }
         output.flush()?;
         drop(output);
-        if cancel.load(AtomicOrdering::Relaxed) {
+        if control.is_cancelled() {
             return Err(CopyError::Cancelled);
         }
         commit_staged_file(&temporary, destination)?;

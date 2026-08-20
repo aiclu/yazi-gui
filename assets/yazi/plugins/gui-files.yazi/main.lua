@@ -12,16 +12,13 @@ local function publish_files()
 		files[i] = {
 			name = tostring(f.name),
 			is_dir = not not cha.is_dir,
-			is_hidden = not not cha.is_hidden,
 			size = cha.len or 0,
 			mtime = cha.mtime or 0,
 		}
 	end
-	local hovered = current.hovered
 	ps.pub("gui-files", {
 		cwd = tostring(current.cwd),
 		files = files,
-		hovered = hovered and tostring(hovered.url) or nil,
 	})
 end
 

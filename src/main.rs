@@ -48,10 +48,10 @@ use workspace::{
 };
 mod ui;
 use ui::{
-    InputElement, MenuAction, UiIntent, UiProjection, action_button, back_button, computer_button,
-    dialog_button, forward_button, icon_button, menu_item, menu_items_for, new_tab_button,
-    parent_button, refresh_button, resize_handle, tab_button, tab_name, tab_scroll_button,
-    toolbar_divider, window_control_button,
+    BRAND_ICON_ASSET, Icon, InputElement, MenuAction, UiIntent, UiProjection, action_button,
+    back_button, computer_button, dialog_button, forward_button, icon, icon_asset, icon_button,
+    menu_item, menu_items_for, new_tab_button, parent_button, refresh_button, resize_handle,
+    tab_button, tab_name, tab_scroll_button, toolbar_divider, window_control_button,
 };
 mod settings;
 use platform::tray::{TrayCommand, TrayController};
@@ -123,7 +123,7 @@ fn default_start_dir() -> String {
         .into_owned()
 }
 
-const APPLICATION_ICON_ASSET: &str = "icons/yazi-gui.svg";
+const APPLICATION_ICON_ASSET: &str = BRAND_ICON_ASSET;
 
 struct AppAssets;
 
@@ -133,6 +133,9 @@ impl AssetSource for AppAssets {
             return Ok(Some(std::borrow::Cow::Borrowed(include_bytes!(
                 "../assets/icons/yazi-gui.svg"
             ))));
+        }
+        if let Some(bytes) = icon_asset(path) {
+            return Ok(Some(std::borrow::Cow::Borrowed(bytes)));
         }
         Ok(None)
     }
@@ -165,6 +168,7 @@ struct Theme {
     text: Hsla,
     muted: Hsla,
     blue: Hsla,
+    danger: Hsla,
     syntax_theme: &'static str,
 }
 
@@ -182,6 +186,7 @@ impl Theme {
             text: rgb(0xf5f5f5).into(),
             muted: rgb(0xb3b3b3).into(),
             blue: rgb(0x60cdff).into(),
+            danger: rgb(0xff7b8a).into(),
             syntax_theme: "base16-ocean.dark",
         }
     }
@@ -199,6 +204,7 @@ impl Theme {
             text: rgb(0x1a1a1a).into(),
             muted: rgb(0x616161).into(),
             blue: rgb(0x0067c0).into(),
+            danger: rgb(0xc42b1c).into(),
             syntax_theme: "InspiredGitHub",
         }
     }
@@ -3154,7 +3160,16 @@ impl Root {
                         this.show_computer_view(cx);
                         cx.stop_propagation();
                     }))
-                    .child(div().text_sm().child(format!("🖥 {}", self.tr("此电脑")))),
+                    .child(icon(
+                        Icon::Computer,
+                        16.0,
+                        if computer_view {
+                            theme.blue
+                        } else {
+                            theme.text
+                        },
+                    ))
+                    .child(div().text_sm().child(self.tr("此电脑"))),
             )
             .child(
                 div()
@@ -3199,22 +3214,24 @@ impl Root {
                 let selected = !self.cur().computer_view
                     && tree_path_key(&self.cur().cwd) == tree_path_key(&entry.path);
                 let favorite = self.is_favorite(&entry.path);
-                let arrow = if entry.is_link {
-                    " "
-                } else if expanded {
-                    "▾"
-                } else {
-                    "▸"
-                };
                 let toggle_path = entry.path.clone();
                 let navigate_path = entry.path.clone();
                 let favorite_path = entry.path.clone();
                 let row_id = SharedString::from(format!("tree-row-{}", tree_path_key(&entry.path)));
                 let toggle = div()
                     .w(px(16.0))
-                    .text_sm()
+                    .h(px(16.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
                     .text_color(theme.muted)
-                    .child(arrow);
+                    .child(if entry.is_link {
+                        div().w(px(1.0)).into_any_element()
+                    } else if expanded {
+                        icon(Icon::ChevronDown, 14.0, theme.muted).into_any_element()
+                    } else {
+                        icon(Icon::ChevronRight, 14.0, theme.muted).into_any_element()
+                    });
                 let toggle = if is_link {
                     toggle.into_any_element()
                 } else {
@@ -3257,6 +3274,11 @@ impl Root {
                         cx.stop_propagation();
                     }))
                     .child(toggle)
+                    .child(icon(
+                        Icon::Folder,
+                        15.0,
+                        if selected { theme.blue } else { theme.text },
+                    ))
                     .child(
                         div()
                             .flex_1()
@@ -3281,7 +3303,15 @@ impl Root {
                                 this.toggle_favorite_path(favorite_path.clone(), cx);
                                 cx.stop_propagation();
                             }))
-                            .child(if favorite { "★" } else { "☆" }),
+                            .child(icon(
+                                if favorite {
+                                    Icon::StarFilled
+                                } else {
+                                    Icon::Star
+                                },
+                                14.0,
+                                if favorite { theme.blue } else { theme.muted },
+                            )),
                     )
                     .into_any_element()
             }
@@ -3345,7 +3375,7 @@ impl Root {
             }
             let remove_path = favorite.clone();
             bar = bar.child(
-                item.child(div().text_sm().child(file_icon("", true)))
+                item.child(icon(file_icon("", true), 15.0, theme.text))
                     .child(div().text_sm().child(label))
                     .child(
                         div()
@@ -3356,7 +3386,7 @@ impl Root {
                                 this.toggle_favorite_path(remove_path.clone(), cx);
                                 cx.stop_propagation();
                             }))
-                            .child("×"),
+                            .child(icon(Icon::Close, 13.0, theme.muted)),
                     ),
             );
         }
@@ -3476,7 +3506,7 @@ impl Root {
                 cx,
                 theme,
                 "titlebar-settings",
-                "⚙",
+                Icon::Settings,
                 self.tr("设置"),
                 UiIntent::ShowSettings,
             ))
@@ -3484,7 +3514,7 @@ impl Root {
                 cx,
                 theme,
                 "titlebar-minimize",
-                "−",
+                Icon::Minimize,
                 self.tr("最小化"),
                 UiIntent::MinimizeWindow,
             ))
@@ -3492,7 +3522,7 @@ impl Root {
                 cx,
                 theme,
                 "titlebar-maximize",
-                "□",
+                Icon::Maximize,
                 self.tr("最大化"),
                 UiIntent::ToggleMaximize,
             ))
@@ -3500,7 +3530,7 @@ impl Root {
                 cx,
                 theme,
                 "titlebar-close",
-                "×",
+                Icon::Close,
                 self.tr("关闭"),
                 UiIntent::RequestClose,
             ))
@@ -3560,7 +3590,7 @@ impl Root {
                 cx,
                 theme,
                 "tab-scroll-left",
-                "‹",
+                Icon::ArrowLeft,
                 settings::translate(language, "向左滚动标签页"),
                 can_scroll_left,
                 UiIntent::ShiftTabs(-1),
@@ -3574,7 +3604,7 @@ impl Root {
                 cx,
                 theme,
                 "tab-scroll-right",
-                "›",
+                Icon::ArrowRight,
                 settings::translate(language, "向右滚动标签页"),
                 can_scroll_right,
                 UiIntent::ShiftTabs(1),
@@ -3800,10 +3830,10 @@ impl Render for Root {
         }));
         let focus_handle = self.focus_handle.clone();
         let theme = self.theme;
-        let favorite_label = if !computer_view && self.is_favorite(&self.cur().cwd) {
-            "★"
+        let favorite_icon = if !computer_view && self.is_favorite(&self.cur().cwd) {
+            Icon::StarFilled
         } else {
-            "☆"
+            Icon::Star
         };
         let favorite_tooltip = if !computer_view && self.is_favorite(&self.cur().cwd) {
             self.tr("取消收藏当前目录")
@@ -3827,7 +3857,7 @@ impl Render for Root {
                 cx,
                 theme,
                 "btn-open",
-                "↗",
+                Icon::ExternalLink,
                 self.tr("打开"),
                 UiIntent::OpenSelected,
             ))
@@ -3835,7 +3865,7 @@ impl Render for Root {
                 cx,
                 theme,
                 "btn-delete",
-                "⌫",
+                Icon::Trash,
                 self.tr("删除"),
                 UiIntent::DeleteSelected,
             ))
@@ -3843,7 +3873,7 @@ impl Render for Root {
                 cx,
                 theme,
                 "btn-rename",
-                "✎",
+                Icon::Edit,
                 self.tr("重命名"),
                 UiIntent::StartRename,
             ))
@@ -3851,7 +3881,7 @@ impl Render for Root {
                 cx,
                 theme,
                 "btn-yank",
-                "⧉",
+                Icon::Copy,
                 self.tr("复制"),
                 UiIntent::CopySelected,
             ))
@@ -3859,7 +3889,7 @@ impl Render for Root {
                 cx,
                 theme,
                 "btn-cut",
-                "✂",
+                Icon::Cut,
                 self.tr("剪切"),
                 UiIntent::CutSelected,
             ))
@@ -3867,7 +3897,7 @@ impl Render for Root {
                 cx,
                 theme,
                 "btn-paste",
-                "📋",
+                Icon::Clipboard,
                 self.tr("粘贴"),
                 UiIntent::PasteClipboard,
             ))
@@ -3876,7 +3906,7 @@ impl Render for Root {
                 cx,
                 theme,
                 "btn-newfile",
-                "📄+",
+                Icon::FilePlus,
                 self.tr("新建文件"),
                 UiIntent::StartNewFile,
             ))
@@ -3884,7 +3914,7 @@ impl Render for Root {
                 cx,
                 theme,
                 "btn-newdir",
-                "📁+",
+                Icon::FolderPlus,
                 self.tr("新建文件夹"),
                 UiIntent::StartNewDir,
             ))
@@ -3893,7 +3923,7 @@ impl Render for Root {
                 cx,
                 theme,
                 "btn-preview-toggle",
-                "◫",
+                Icon::LayoutPanel,
                 self.tr(if self.preview_collapsed {
                     "展开预览"
                 } else {
@@ -3971,7 +4001,7 @@ impl Render for Root {
                         cx,
                         theme,
                         "btn-favorite-current",
-                        favorite_label,
+                        favorite_icon,
                         favorite_tooltip,
                         UiIntent::ToggleCurrentFavorite,
                     ))
@@ -4299,10 +4329,10 @@ fn is_image_file(path: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 根据文件类型返回一个 emoji 图标（用于文件列表）。
-fn file_icon(name: &str, is_dir: bool) -> &'static str {
+/// 根据文件类型返回统一的文件图标（用于文件列表和收藏夹）。
+fn file_icon(name: &str, is_dir: bool) -> Icon {
     if is_dir {
-        return "📁";
+        return Icon::Folder;
     }
     let ext = std::path::Path::new(name)
         .extension()
@@ -4310,12 +4340,12 @@ fn file_icon(name: &str, is_dir: bool) -> &'static str {
         .unwrap_or("")
         .to_ascii_lowercase();
     match ext.as_str() {
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "ico" | "avif" => "🖼️",
-        "zip" | "tar" | "gz" | "rar" | "7z" | "xz" | "bz2" => "📦",
-        "exe" | "dll" | "msi" | "bin" => "⚙️",
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "ico" | "avif" => Icon::Image,
+        "zip" | "tar" | "gz" | "rar" | "7z" | "xz" | "bz2" => Icon::Archive,
+        "exe" | "dll" | "msi" | "bin" => Icon::Binary,
         "rs" | "py" | "js" | "ts" | "go" | "c" | "cpp" | "h" | "hpp" | "java" | "lua" | "toml"
-        | "json" | "yaml" | "yml" | "sh" | "md" | "html" | "css" | "rb" | "php" => "📝",
-        _ => "📄",
+        | "json" | "yaml" | "yml" | "sh" | "md" | "html" | "css" | "rb" | "php" => Icon::Code,
+        _ => Icon::File,
     }
 }
 
@@ -4489,11 +4519,11 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        APPLICATION_ICON_ASSET, AppAssets, DeleteSummary, FileEntry, LayoutState,
+        APPLICATION_ICON_ASSET, AppAssets, DeleteSummary, FileEntry, Icon, LayoutState,
         MODIFIED_WIDTH_MIN, PREVIEW_WIDTH_MAX, ResizeTarget, ShortcutAction, SortDirection,
         SortField, SortState, TAB_DEFAULT_WIDTH, TAB_MIN_WIDTH, TREE_WIDTH_MIN, TransferControl,
         TransferOutcome, clamp_layout_width, copy_paths_with_progress, delete_status,
-        favorite_path_key, format_mtime, horizontal_scrollbar_metrics, is_unc_path,
+        favorite_path_key, file_icon, format_mtime, horizontal_scrollbar_metrics, is_unc_path,
         keystroke_to_shortcut, normalize_favorite_path, normalize_shortcut, normalize_single_path,
         permanent_delete, reconcile_selection, resolve_address_path, scan_folder_children,
         search_directory, shortcut_actions, shortcut_matches, sort_files, tab_bar_metrics,
@@ -4877,5 +4907,15 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(bytes.starts_with(b"<svg"));
+    }
+
+    #[test]
+    fn file_types_use_the_uniform_icon_categories() {
+        assert_eq!(file_icon("folder", true), Icon::Folder);
+        assert_eq!(file_icon("photo.png", false), Icon::Image);
+        assert_eq!(file_icon("backup.zip", false), Icon::Archive);
+        assert_eq!(file_icon("tool.exe", false), Icon::Binary);
+        assert_eq!(file_icon("main.rs", false), Icon::Code);
+        assert_eq!(file_icon("notes.pdf", false), Icon::File);
     }
 }

@@ -1,4 +1,5 @@
 use super::super::*;
+use super::icons::{Icon, icon};
 use super::{MenuAction, UiIntent};
 
 pub(crate) fn tab_name(cwd: &str) -> String {
@@ -59,7 +60,7 @@ pub(crate) fn tab_button(
                 .flex_shrink_0()
                 .px_1()
                 .cursor_pointer()
-                .child("×")
+                .child(icon(Icon::Close, 13.0, theme.muted))
                 .id(SharedString::from(format!("tab-close-{}", i)))
                 .on_click(cx.listener(move |this, _e, window, cx| {
                     this.dispatch_ui_intent(UiIntent::CloseTab(i), window, cx);
@@ -73,7 +74,7 @@ pub(crate) fn tab_scroll_button(
     cx: &mut Context<Root>,
     theme: Theme,
     id: &'static str,
-    icon: &'static str,
+    glyph: Icon,
     tooltip: impl Into<SharedString>,
     enabled: bool,
     intent: UiIntent,
@@ -112,7 +113,11 @@ pub(crate) fn tab_scroll_button(
             }
             cx.stop_propagation();
         }))
-        .child(icon)
+        .child(icon(
+            glyph,
+            16.0,
+            if enabled { theme.text } else { theme.muted },
+        ))
 }
 
 struct TooltipView {
@@ -139,7 +144,7 @@ pub(crate) fn icon_button(
     cx: &mut Context<Root>,
     theme: Theme,
     id: &'static str,
-    icon: impl Into<SharedString>,
+    glyph: Icon,
     tooltip: impl Into<SharedString>,
     intent: UiIntent,
 ) -> impl IntoElement {
@@ -156,7 +161,15 @@ pub(crate) fn icon_button(
         .rounded_sm()
         .cursor_pointer()
         .text_base()
-        .child(icon.into())
+        .child(icon(
+            glyph,
+            16.0,
+            match glyph {
+                Icon::Trash => theme.danger,
+                Icon::StarFilled => theme.blue,
+                _ => theme.text,
+            },
+        ))
         .id(id)
         .hover(|style| style.bg(theme.hover))
         .tooltip(move |_window, cx| {
@@ -176,7 +189,7 @@ pub(crate) fn window_control_button(
     cx: &mut Context<Root>,
     theme: Theme,
     id: &'static str,
-    icon: &'static str,
+    glyph: Icon,
     tooltip: impl Into<SharedString>,
     intent: UiIntent,
 ) -> impl IntoElement {
@@ -202,7 +215,7 @@ pub(crate) fn window_control_button(
             this.dispatch_ui_intent(intent.clone(), window, cx);
             cx.stop_propagation();
         }))
-        .child(icon)
+        .child(icon(glyph, 16.0, theme.text))
 }
 
 pub(crate) fn resize_handle(
@@ -261,7 +274,7 @@ pub(crate) fn new_tab_button(
         cx,
         theme,
         "btn-new-tab",
-        "+",
+        Icon::Add,
         settings::translate(language, "新建标签页"),
         UiIntent::NewTab,
     )
@@ -276,7 +289,7 @@ pub(crate) fn refresh_button(
         cx,
         theme,
         "btn-refresh",
-        "↻",
+        Icon::Refresh,
         settings::translate(language, "刷新"),
         UiIntent::Refresh,
     )
@@ -292,7 +305,7 @@ pub(crate) fn back_button(
         cx,
         theme,
         "btn-back",
-        "←",
+        Icon::ArrowLeft,
         settings::translate(language, "后退"),
         enabled,
         UiIntent::Back,
@@ -309,7 +322,7 @@ pub(crate) fn forward_button(
         cx,
         theme,
         "btn-forward",
-        "→",
+        Icon::ArrowRight,
         settings::translate(language, "前进"),
         enabled,
         UiIntent::Forward,
@@ -325,7 +338,7 @@ pub(crate) fn parent_button(
         cx,
         theme,
         "btn-parent",
-        "↑",
+        Icon::ArrowUp,
         settings::translate(language, "上级"),
         UiIntent::Parent,
     )
@@ -340,7 +353,7 @@ pub(crate) fn computer_button(
         cx,
         theme,
         "btn-computer",
-        "🖥",
+        Icon::Computer,
         settings::translate(language, "此电脑"),
         UiIntent::Computer,
     )
@@ -562,17 +575,20 @@ pub(crate) fn sort_header(
 ) -> AnyElement {
     let label: SharedString = label.into();
     let active = sort.field == field;
-    let arrow = if active {
-        match sort.direction {
-            SortDirection::Ascending => " ↑",
-            SortDirection::Descending => " ↓",
-        }
+    let sort_icon = if active {
+        Some(match sort.direction {
+            SortDirection::Ascending => Icon::ArrowUp,
+            SortDirection::Descending => Icon::ArrowDown,
+        })
     } else {
-        ""
+        None
     };
-    div()
+    let mut header = div()
         .w(px(width))
         .flex_shrink_0()
+        .flex()
+        .items_center()
+        .gap_1()
         .cursor_pointer()
         .text_xs()
         .whitespace_nowrap()
@@ -583,8 +599,11 @@ pub(crate) fn sort_header(
             this.dispatch_ui_intent(UiIntent::ToggleSort(field), window, cx);
             cx.stop_propagation();
         }))
-        .child(SharedString::from(format!("{}{}", label, arrow)))
-        .into_any_element()
+        .child(label);
+    if let Some(sort_icon) = sort_icon {
+        header = header.child(icon(sort_icon, 12.0, theme.text));
+    }
+    header.into_any_element()
 }
 
 fn column_spacer() -> impl IntoElement {
@@ -603,11 +622,11 @@ pub(crate) fn file_row(
     inline: bool,
     inline_input: Option<AnyElement>,
 ) -> impl IntoElement {
-    let icon = file_icon(&name, is_dir);
-    let display = SharedString::from(if is_dir {
-        format!("{} {}/", icon, name)
+    let entry_icon = file_icon(&name, is_dir);
+    let display_name = SharedString::from(if is_dir {
+        format!("{}/", name)
     } else {
-        format!("{} {}", icon, name)
+        name.clone()
     });
     let modified = SharedString::from(format_mtime(mtime));
     let meta = SharedString::from(if is_dir {
@@ -641,12 +660,21 @@ pub(crate) fn file_row(
         div()
             .w(px(layout.name_width))
             .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap_1()
             .text_sm()
             .whitespace_nowrap()
             .overflow_hidden()
-            .text_ellipsis()
             .text_color(name_color)
-            .child(display)
+            .child(icon(entry_icon, 16.0, name_color))
+            .child(
+                div()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .child(display_name),
+            )
     };
 
     let mut row = div()

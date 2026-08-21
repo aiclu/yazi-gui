@@ -2,6 +2,7 @@ use super::*;
 
 pub(crate) mod components;
 pub(crate) mod files_page;
+pub(crate) mod icons;
 pub(crate) mod input;
 pub(crate) mod settings_page;
 
@@ -10,6 +11,7 @@ pub(crate) use components::{
     menu_item, menu_items_for, new_tab_button, parent_button, refresh_button, resize_handle,
     tab_button, tab_name, tab_scroll_button, toolbar_divider, window_control_button,
 };
+pub(crate) use icons::{BRAND_ICON_ASSET, Icon, icon, icon_asset};
 pub(crate) use input::InputElement;
 
 #[derive(Clone, Copy)]

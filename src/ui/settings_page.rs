@@ -1,6 +1,6 @@
 use super::super::*;
-use super::UiIntent;
 use super::components::{action_button, settings_line, shortcut_binding_view};
+use super::{Icon, UiIntent, icon};
 
 pub(crate) fn render(
     view: &UiProjection,
@@ -44,12 +44,10 @@ pub(crate) fn render(
         Vec::new()
     };
     let shortcut_indicator = if view.shortcuts_expanded {
-        "▾"
+        Icon::ChevronDown
     } else {
-        "▸"
+        Icon::ChevronRight
     };
-    let shortcuts_label =
-        SharedString::from(format!("{} {}", shortcut_indicator, view.tr("快捷键")));
 
     div()
         .size_full()
@@ -196,7 +194,11 @@ pub(crate) fn render(
                                 .on_click(cx.listener(|this, _event, window, cx| {
                                     this.dispatch_ui_intent(UiIntent::ToggleShortcuts, window, cx);
                                 }))
-                                .child(shortcuts_label),
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(icon(shortcut_indicator, 14.0, theme.text))
+                                .child(view.tr("快捷键")),
                             div().w_full().flex().flex_col().gap_1().children(shortcuts),
                         ))
                         .child(section_card(
